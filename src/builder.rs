@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::default::Default;
 use std::path::PathBuf;
@@ -14,11 +14,12 @@ use std::time::SystemTime;
 use std::{fmt, fs};
 
 use bdk_wallet::template::Bip84;
-use bdk_wallet::{KeychainKind, Wallet as BdkWallet};
+use bdk_wallet::{KeychainKind, Wallet as BdkWallet, Update};
 use bip39::Mnemonic;
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Network};
+use bdk_chain::{BlockId, TxUpdate};
 use lightning::chain::{chainmonitor, BestBlock, Watch};
 use lightning::io::Cursor;
 use lightning::ln::channelmanager::{self, ChainParameters, ChannelManagerReadArgs};
@@ -38,6 +39,7 @@ use lightning::util::persist::{
 };
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
+use lightning_block_sync::BlockSource;
 use lightning_persister::fs_store::FilesystemStore;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
 
@@ -763,6 +765,33 @@ impl NodeBuilder {
 				BuildError::RuntimeSetupFailed
 			})?)
 		};
+
+		let seed_bytes = seed_bytes_from_config(
+			&self.config,
+			self.entropy_source_config.as_ref(),
+			Arc::clone(&logger),
+		)?;
+		let config = Arc::new(self.config.clone());
+
+		build_with_store_internal(
+			config,
+			self.chain_data_source_config.as_ref(),
+			self.gossip_source_config.as_ref(),
+			self.liquidity_source_config.as_ref(),
+			self.pathfinding_scores_sync_config.as_ref(),
+			self.async_payments_role,
+			seed_bytes,
+			runtime,
+			logger,
+			kv_store,
+		)
+	}
+
+		/// Builds a [`Node`] instance according to the options previously configured.
+	pub fn build_with_store_and_runtime(
+		&self, kv_store: Arc<DynStore>, runtime: Arc<tokio::runtime::Runtime>,
+	) -> Result<Node, BuildError> {
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
