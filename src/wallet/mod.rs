@@ -16,6 +16,8 @@ use crate::payment::{PaymentDetails, PaymentDirection, PaymentStatus};
 use crate::types::PaymentStore;
 use crate::Error;
 
+use bdk_chain::CheckPoint;
+
 use lightning::chain::chaininterface::BroadcasterInterface;
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::{BestBlock, Listen};
@@ -120,6 +122,10 @@ where
 	pub(crate) fn current_best_block(&self) -> BestBlock {
 		let checkpoint = self.inner.lock().unwrap().latest_checkpoint();
 		BestBlock { block_hash: checkpoint.hash(), height: checkpoint.height() }
+	}
+
+	pub(crate) fn latest_checkpoint(&self) -> CheckPoint {
+		self.inner.lock().unwrap().latest_checkpoint()
 	}
 
 	pub(crate) fn apply_update(&self, update: impl Into<Update>) -> Result<(), Error> {
