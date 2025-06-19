@@ -59,8 +59,13 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	Arc<KeysManager>,
 >;
 
-pub(crate) type LiquidityManager =
-	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainSource>>;
+pub(crate) type LiquidityManager<L> = lightning_liquidity::LiquidityManager<
+	Arc<KeysManager>,
+	Arc<ChannelManager>,
+	Arc<ChainSource>,
+	Arc<DynStore>,
+	L,
+>;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<ChainMonitor>,
