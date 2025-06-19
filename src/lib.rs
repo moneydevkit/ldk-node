@@ -169,6 +169,8 @@ pub use {
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
 
+const HTLC_EXPIRY_CHECK_INTERVAL_SECS: u64 = 5;
+
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
 
@@ -631,6 +633,9 @@ impl Node {
 								"Stopping processing liquidity events.",
 							);
 							return;
+						}
+						_ = tokio::time::sleep(Duration::from_secs(HTLC_EXPIRY_CHECK_INTERVAL_SECS)) => {
+								liquidity_handler.handle_expired_htlcs();
 						}
 						_ = liquidity_handler.handle_next_event() => {}
 					}

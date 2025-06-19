@@ -62,7 +62,8 @@ use crate::io::{
 	self, PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::liquidity::{
-	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
+	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LSPS4ClientConfig,
+	LSPS4ServiceConfig, LiquiditySourceBuilder,
 };
 use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
@@ -129,6 +130,10 @@ struct LiquiditySourceConfig {
 	lsps2_client: Option<LSPS2ClientConfig>,
 	// Act as an LSPS2 service.
 	lsps2_service: Option<LSPS2ServiceConfig>,
+	// Act as an LSPS4 client connecting to the given service.
+	lsps4_client: Option<LSPS4ClientConfig>,
+	// Act as an LSPS4 service.
+	lsps4_service: Option<LSPS4ServiceConfig>,
 }
 
 #[derive(Clone)]
@@ -475,6 +480,23 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
+	/// LSPS4 service.
+	///
+	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	pub fn set_liquidity_source_lsps4(
+		&mut self, node_id: PublicKey, address: SocketAddress,
+	) -> &mut Self {
+		// Mark the LSP as trusted for 0conf
+		self.config.trusted_peers_0conf.push(node_id.clone());
+
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		let lsps4_client_config = LSPS4ClientConfig { node_id, address };
+		liquidity_source_config.lsps4_client = Some(lsps4_client_config);
+		self
+	}
+
 	/// Configures the [`Node`] instance to provide an [LSPS2] service, issuing just-in-time
 	/// channels to clients.
 	///
@@ -487,6 +509,17 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some(service_config);
+		self
+	}
+
+	/// Configures the [`Node`] instance to provide an LSPS4 service, issuing just-in-time
+	/// channels to clients.
+	pub fn set_liquidity_provider_lsps4(
+		&mut self, service_config: LSPS4ServiceConfig,
+	) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps4_service = Some(service_config);
 		self
 	}
 
@@ -793,6 +826,10 @@ impl NodeBuilder {
 	) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
+		// Convert tokio::runtime::Runtime to ldk-node's Runtime
+		let runtime_handle = runtime.handle().clone();
+		let ldk_runtime = Arc::new(Runtime::with_handle(runtime_handle, Arc::clone(&logger)));
+
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
 			self.entropy_source_config.as_ref(),
@@ -808,7 +845,7 @@ impl NodeBuilder {
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.async_payments_role,
 			seed_bytes,
-			runtime,
+			ldk_runtime,
 			logger,
 			kv_store,
 		)
@@ -1494,7 +1531,10 @@ fn build_with_store_internal(
 
 	let mut user_config = default_user_config(&config);
 
-	if liquidity_source_config.and_then(|lsc| lsc.lsps2_service.as_ref()).is_some() {
+	let is_lsp_client = liquidity_source_config
+		.map(|lsc| lsc.lsps2_client.is_some() || lsc.lsps4_client.is_some())
+		.unwrap_or(false);
+	if is_lsp_client {
 		// If we act as an LSPS2 service, we need to to be able to intercept HTLCs and forward the
 		// information to the service handler.
 		user_config.accept_intercept_htlcs = true;
@@ -1651,6 +1691,19 @@ fn build_with_store_internal(
 		},
 	};
 
+	let event_queue = match io::utils::read_event_queue(Arc::clone(&kv_store), Arc::clone(&logger))
+	{
+		Ok(event_queue) => Arc::new(event_queue),
+		Err(e) => {
+			if e.kind() == std::io::ErrorKind::NotFound {
+				Arc::new(EventQueue::new(Arc::clone(&kv_store), Arc::clone(&logger)))
+			} else {
+				log_error!(logger, "Failed to read event queue from store: {}", e);
+				return Err(BuildError::ReadFailed);
+			}
+		},
+	};
+
 	let (liquidity_source, custom_message_handler) =
 		if let Some(lsc) = liquidity_source_config.as_ref() {
 			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
@@ -1662,6 +1715,7 @@ fn build_with_store_internal(
 				Arc::clone(&kv_store),
 				Arc::clone(&config),
 				Arc::clone(&logger),
+				Arc::clone(&event_queue),
 			);
 
 			lsc.lsps1_client.as_ref().map(|config| {
@@ -1680,6 +1734,10 @@ fn build_with_store_internal(
 				)
 			});
 
+			lsc.lsps4_client.as_ref().map(|config| {
+				liquidity_source_builder.lsps4_client(config.node_id, config.address.clone())
+			});
+
 			let promise_secret = {
 				let lsps_xpriv = derive_xprv(
 					Arc::clone(&config),
@@ -1692,6 +1750,10 @@ fn build_with_store_internal(
 			lsc.lsps2_service.as_ref().map(|config| {
 				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
 			});
+
+			lsc.lsps4_service
+				.as_ref()
+				.map(|config| liquidity_source_builder.lsps4_service(config.clone()));
 
 			let liquidity_source = runtime
 				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
@@ -1774,19 +1836,6 @@ fn build_with_store_internal(
 				))
 			} else {
 				log_error!(logger, "Failed to read output sweeper data from store: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
-	};
-
-	let event_queue = match io::utils::read_event_queue(Arc::clone(&kv_store), Arc::clone(&logger))
-	{
-		Ok(event_queue) => Arc::new(event_queue),
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				Arc::new(EventQueue::new(Arc::clone(&kv_store), Arc::clone(&logger)))
-			} else {
-				log_error!(logger, "Failed to read event queue from store: {}", e);
 				return Err(BuildError::ReadFailed);
 			}
 		},

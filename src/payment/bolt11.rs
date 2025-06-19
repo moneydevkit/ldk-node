@@ -27,7 +27,7 @@ use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::error::Error;
 use crate::ffi::{maybe_deref, maybe_try_convert_enum, maybe_wrap};
-use crate::liquidity::LiquiditySource;
+use crate::liquidity::{LiquiditySource, LSPS2_CHANNEL_CLTV_EXPIRY_DELTA};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{
 	LSPFeeLimits, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind,
@@ -742,6 +742,74 @@ impl Bolt11Payment {
 		self.peer_store.add_peer(peer_info)?;
 
 		Ok(invoice)
+	}
+
+	/// Returns a payable invoice that can be used to request a payment of the amount given and
+	/// receive it via a newly created just-in-time (JIT) channel.
+	///
+	/// When the returned invoice is paid, the configured LSPS4-compliant LSP will open a channel
+	/// to us whenever we need more liquidity.
+	pub fn receive_via_lsps4_jit_channel(
+		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let (node_id, address) =
+			liquidity_source.get_lsps4_lsp_details().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let peer_info = PeerInfo { node_id, address };
+
+		let con_node_id = peer_info.node_id;
+		let con_addr = peer_info.address.clone();
+		let con_cm = Arc::clone(&self.connection_manager);
+
+		// We need to use our main runtime here as a local runtime might not be around to poll
+		// connection futures going forward.
+		self.runtime.block_on(async move {
+			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
+		})?;
+
+		log_info!(self.logger, "Connected to LSP {}@{}. ", peer_info.node_id, peer_info.address);
+
+		let liquidity_source = Arc::clone(&liquidity_source);
+		let invoice = self.runtime.block_on(async move {
+			liquidity_source
+				.lsps4_receive_to_jit_channel(amount_msat, &description, expiry_secs)
+				.await
+		})?;
+
+		// Persist LSP peer to make sure we reconnect on restart.
+		self.peer_store.add_peer(peer_info)?;
+
+		Ok(maybe_wrap(invoice))
+	}
+
+	/// Returns a payable invoice that can be used to request a payment of the amount given and
+	/// receive it via a newly created just-in-time (JIT) channel.
+	///
+	/// When the returned invoice is paid, the configured LSPS4-compliant LSP will open a channel
+	/// to us whenever we need more liquidity.
+	pub fn receive_via_lsps4_jit_channel_with_scid(
+		&self, intercept_scid: u64, amount_msat: Option<u64>,
+		description: &Bolt11InvoiceDescription, expiry_secs: u32,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let invoice = liquidity_source.lsps4_create_jit_invoice(
+			intercept_scid,
+			LSPS2_CHANNEL_CLTV_EXPIRY_DELTA,
+			amount_msat,
+			&description,
+			expiry_secs,
+		)?;
+
+		Ok(maybe_wrap(invoice))
 	}
 
 	/// Sends payment probes over all paths of a route that would be used to pay the given invoice.

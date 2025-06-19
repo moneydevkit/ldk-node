@@ -234,6 +234,11 @@ pub enum Event {
 		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
 		reason: Option<ClosureReason>,
 	},
+	/// A webhook needs to be sent.
+	SendWebhook {
+		/// The node id of the node that needs to be notified.
+		node_id: PublicKey,
+	},
 	/// A channel splice is pending confirmation on-chain.
 	SplicePending {
 		/// The `channel_id` of the channel.
@@ -314,13 +319,16 @@ impl_writeable_tlv_based_enum!(Event,
 		(12, claim_from_onchain_tx, required),
 		(14, outbound_amount_forwarded_msat, option),
 	},
-	(8, SplicePending) => {
+	(8, SendWebhook) => {
+		(0, node_id, required),
+	},
+	(9, SplicePending) => {
 		(1, channel_id, required),
 		(3, counterparty_node_id, required),
 		(5, user_channel_id, required),
 		(7, new_funding_txo, required),
 	},
-	(9, SpliceFailed) => {
+	(10, SpliceFailed) => {
 		(1, channel_id, required),
 		(3, counterparty_node_id, required),
 		(5, user_channel_id, required),
