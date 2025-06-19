@@ -224,6 +224,11 @@ pub enum Event {
 		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
 		reason: Option<ClosureReason>,
 	},
+	/// A webhook needs to be sent.
+	SendWebhook {
+		/// The node id of the node that needs to be notified.
+		node_id: PublicKey,
+	},
 }
 
 impl_writeable_tlv_based_enum!(Event,
@@ -280,7 +285,10 @@ impl_writeable_tlv_based_enum!(Event,
 		(10, skimmed_fee_msat, option),
 		(12, claim_from_onchain_tx, required),
 		(14, outbound_amount_forwarded_msat, option),
-	}
+	},
+	(8, SendWebhook) => {
+		(0, node_id, required),
+	},
 );
 
 pub struct EventQueue<L: Deref>

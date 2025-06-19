@@ -20,7 +20,7 @@ use bitcoin::secp256k1::PublicKey;
 use std::ops::Deref;
 use std::sync::Arc;
 
-pub(crate) enum NodeCustomMessageHandler<L: Deref>
+pub(crate) enum NodeCustomMessageHandler<L: Deref + Clone>
 where
 	L::Target: Logger,
 {
@@ -28,7 +28,7 @@ where
 	Liquidity { liquidity_source: Arc<LiquiditySource<L>> },
 }
 
-impl<L: Deref> NodeCustomMessageHandler<L>
+impl<L: Deref + Clone> NodeCustomMessageHandler<L>
 where
 	L::Target: Logger,
 {
@@ -41,7 +41,7 @@ where
 	}
 }
 
-impl<L: Deref> CustomMessageReader for NodeCustomMessageHandler<L>
+impl<L: Deref + Clone> CustomMessageReader for NodeCustomMessageHandler<L>
 where
 	L::Target: Logger,
 {
@@ -59,7 +59,7 @@ where
 	}
 }
 
-impl<L: Deref> CustomMessageHandler for NodeCustomMessageHandler<L>
+impl<L: Deref + Clone> CustomMessageHandler for NodeCustomMessageHandler<L>
 where
 	L::Target: Logger,
 {
