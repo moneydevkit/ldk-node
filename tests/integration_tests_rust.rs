@@ -7,7 +7,35 @@
 
 mod common;
 
-use std::collections::HashSet;
+use common::{
+	do_channel_full_cycle, expect_channel_pending_event, expect_channel_ready_event, expect_event,
+	expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait,
+	logging::{init_log_logger, validate_log_entry, TestLogWriter},
+	open_channel, premine_and_distribute_funds, random_config, random_listening_addresses,
+	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, wait_for_tx,
+	TestChainSource, TestSyncStore,
+};
+
+use ldk_node::config::EsploraSyncConfig;
+use ldk_node::liquidity::{LSPS2ServiceConfig, LSPS4ServiceConfig};
+use ldk_node::payment::{
+	ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus, QrPaymentResult,
+	SendingParameters,
+};
+use ldk_node::{Builder, Event, NodeError};
+
+use lightning::ln::channelmanager::PaymentId;
+use lightning::routing::gossip::{NodeAlias, NodeId};
+use lightning::util::persist::KVStore;
+
+use lightning_invoice::{Bolt11InvoiceDescription, Description};
+
+use bitcoin::address::NetworkUnchecked;
+use bitcoin::hashes::Hash;
+use bitcoin::Address;
+use bitcoin::Amount;
+use log::LevelFilter;
+
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -1906,8 +1934,161 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	assert_eq!(client_node.payment(&payment_id).unwrap().status, PaymentStatus::Failed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn facade_logging() {
+#[test]
+fn lsps4_client_service_integration() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+
+	let sync_config = EsploraSyncConfig { background_sync_config: None };
+
+	// Setup three nodes: service, client, and payer.
+	let forwarding_fee_ppm = 20_000u64;
+	let channel_over_provisioning_ppm = 100_000u32;
+	let min_channel_size_msat = 10_000_000u64;
+	let lsps4_service_config = LSPS4ServiceConfig {
+		min_channel_size_msat,
+		channel_over_provisioning_ppm,
+		forwarding_fee_proportional_millionths: forwarding_fee_ppm,
+	};
+
+	let service_config = random_config(true);
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.set_liquidity_provider_lsps4(lsps4_service_config);
+	let service_node = service_builder.build().unwrap();
+	service_node.start().unwrap();
+
+	let service_node_id = service_node.node_id();
+	let service_listen_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config(true);
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr);
+	let client_node = client_builder.build().unwrap();
+	client_node.start().unwrap();
+
+	let payer_config = random_config(true);
+	setup_builder!(payer_builder, payer_config.node_config);
+	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	let payer_node = payer_builder.build().unwrap();
+	payer_node.start().unwrap();
+
+	let service_onchain_addr = service_node.onchain_payment().new_address().unwrap();
+	let client_onchain_addr = client_node.onchain_payment().new_address().unwrap();
+	let payer_onchain_addr = payer_node.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 10_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![service_onchain_addr, client_onchain_addr, payer_onchain_addr],
+		Amount::from_sat(premine_amount_sat),
+	);
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+
+	// Open a channel payer -> service so the payer can reach the client through the LSP.
+	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd);
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	service_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+	expect_channel_ready_event!(payer_node, service_node.node_id());
+	expect_channel_ready_event!(service_node, payer_node.node_id());
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("lsps4 test")).unwrap());
+	let jit_amount_msat = 100_000_000;
+
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_lsps4_jit_channel(Some(jit_amount_msat), &invoice_description, 1024)
+		.unwrap();
+
+	// Have the payer pay the invoice, triggering a JIT channel from service -> client.
+	let payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+
+	let skimmed_fee_msat = (jit_amount_msat * forwarding_fee_ppm) / 1_000_000;
+	let skimmed_fee_sats = skimmed_fee_msat / 1000;
+	let expected_received_amount_msat = jit_amount_msat - skimmed_fee_msat;
+	eprintln!(
+		"[lsps4-test] expected skimmed fee: {} msat ({} sats), expected client amount: {} msat",
+		skimmed_fee_msat, skimmed_fee_sats, expected_received_amount_msat
+	);
+
+	let mut saw_forwarded_event = false;
+	for _ in 0..2 {
+		match service_node.wait_next_event() {
+			Event::PaymentForwarded {
+				skimmed_fee_msat: event_skimmed_fee_msat,
+				outbound_amount_forwarded_msat,
+				..
+			} => {
+					assert_eq!(event_skimmed_fee_msat, Some(skimmed_fee_msat));
+					assert_eq!(outbound_amount_forwarded_msat, Some(expected_received_amount_msat));
+					eprintln!(
+						"[lsps4-test] service forwarded payment; skimmed {} msat ({} sats), forwarded {} msat",
+						event_skimmed_fee_msat.unwrap(),
+						event_skimmed_fee_msat.unwrap() / 1000,
+						outbound_amount_forwarded_msat.unwrap()
+					);
+					saw_forwarded_event = true;
+					service_node.event_handled().unwrap();
+					break;
+				},
+				Event::SendWebhook { .. } => {
+					eprintln!("[lsps4-test] service received webhook notification request");
+					service_node.event_handled().unwrap();
+				},
+			other => {
+				panic!("Unexpected event on service node: {:?}", other);
+			},
+		}
+	}
+	assert!(saw_forwarded_event, "Service node never forwarded the payment");
+
+	expect_payment_successful_event!(payer_node, Some(payment_id), None);
+	let client_payment_id =
+		expect_payment_received_event!(client_node, expected_received_amount_msat).unwrap();
+
+	let client_payment = client_node.payment(&client_payment_id).unwrap();
+	match client_payment.kind {
+		PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
+			assert_eq!(counterparty_skimmed_fee_msat, Some(skimmed_fee_msat));
+			eprintln!(
+				"[lsps4-test] client recorded skimmed fee: {} msat ({} sats)",
+				counterparty_skimmed_fee_msat.unwrap(),
+				counterparty_skimmed_fee_msat.unwrap() / 1000
+			);
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+	assert_eq!(client_payment.amount_msat, Some(expected_received_amount_msat));
+	assert_eq!(client_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(client_payment.status, PaymentStatus::Succeeded);
+
+	let expected_channel_over_provisioning_msat =
+		(expected_received_amount_msat * channel_over_provisioning_ppm as u64) / 1_000_000;
+	let expected_channel_size_sat = std::cmp::max(
+		(expected_received_amount_msat + expected_channel_over_provisioning_msat) / 1000,
+		min_channel_size_msat / 1000,
+	);
+	let client_channels = client_node.list_channels();
+	assert_eq!(client_channels.len(), 1);
+	assert_eq!(client_channels[0].channel_value_sats, expected_channel_size_sat);
+}
+
+#[test]
+fn facade_logging() {
 	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
 

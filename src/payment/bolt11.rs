@@ -781,6 +781,8 @@ impl Bolt11Payment {
 				.await
 		})?;
 
+		self.register_lsps4_payment(&invoice, amount_msat)?;
+
 		// Persist LSP peer to make sure we reconnect on restart.
 		self.peer_store.add_peer(peer_info)?;
 
@@ -808,6 +810,8 @@ impl Bolt11Payment {
 			&description,
 			expiry_secs,
 		)?;
+
+		self.register_lsps4_payment(&invoice, amount_msat)?;
 
 		Ok(maybe_wrap(invoice))
 	}
@@ -930,6 +934,47 @@ impl Bolt11Payment {
 				log_error!(self.logger, "Failed to send payment probes: {:?}", e);
 				Error::ProbeSendingFailed
 			})?;
+
+		Ok(())
+	}
+
+	fn register_lsps4_payment(
+		&self, invoice: &Bolt11Invoice, amount_msat: Option<u64>,
+	) -> Result<(), Error> {
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = invoice.payment_secret();
+		let lsp_fee_limits = LSPFeeLimits {
+			max_total_opening_fee_msat: None,
+			max_proportional_opening_fee_ppm_msat: None,
+		};
+		let id = PaymentId(payment_hash.0);
+		let preimage =
+			self.channel_manager.get_payment_preimage(payment_hash, payment_secret.clone()).ok();
+		let kind = PaymentKind::Bolt11Jit {
+			hash: payment_hash,
+			preimage,
+			secret: Some(payment_secret.clone()),
+			counterparty_skimmed_fee_msat: None,
+			lsp_fee_limits,
+		};
+		let payment = PaymentDetails::new(
+			id,
+			kind,
+			amount_msat,
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+
+		let already_known = self.payment_store.insert(payment)?;
+		if already_known {
+			log_error!(
+				self.logger,
+				"LSPS4 JIT payment with ID {} was previously known",
+				id,
+			);
+			debug_assert!(false);
+		}
 
 		Ok(())
 	}

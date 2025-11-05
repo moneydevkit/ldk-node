@@ -710,33 +710,34 @@ where
 										},
 									)
 								})
-								.unwrap_or(0)
 						},
-						_ => 0,
+						_ => None,
 					};
 
-					if counterparty_skimmed_fee_msat > max_total_opening_fee_msat {
-						log_info!(
-							self.logger,
-							"Refusing inbound payment with hash {} as the counterparty-withheld fee of {}msat exceeds our limit of {}msat",
-							hex_utils::to_string(&payment_hash.0),
-							counterparty_skimmed_fee_msat,
-							max_total_opening_fee_msat,
-						);
-						self.channel_manager.fail_htlc_backwards(&payment_hash);
+					if let Some(max_total_opening_fee_msat) = max_total_opening_fee_msat {
+						if counterparty_skimmed_fee_msat > max_total_opening_fee_msat {
+							log_info!(
+								self.logger,
+								"Refusing inbound payment with hash {} as the counterparty-withheld fee of {}msat exceeds our limit of {}msat",
+								hex_utils::to_string(&payment_hash.0),
+								counterparty_skimmed_fee_msat,
+								max_total_opening_fee_msat,
+							);
+							self.channel_manager.fail_htlc_backwards(&payment_hash);
 
-						let update = PaymentDetailsUpdate {
-							hash: Some(Some(payment_hash)),
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						match self.payment_store.update(&update) {
-							Ok(_) => return Ok(()),
-							Err(e) => {
-								log_error!(self.logger, "Failed to access payment store: {}", e);
-								return Err(ReplayEvent());
-							},
-						};
+							let update = PaymentDetailsUpdate {
+								hash: Some(Some(payment_hash)),
+								status: Some(PaymentStatus::Failed),
+								..PaymentDetailsUpdate::new(payment_id)
+							};
+							match self.payment_store.update(&update) {
+								Ok(_) => return Ok(()),
+								Err(e) => {
+									log_error!(self.logger, "Failed to access payment store: {}", e);
+									return Err(ReplayEvent());
+								},
+							};
+						}
 					}
 
 					// If the LSP skimmed anything, update our stored payment.
