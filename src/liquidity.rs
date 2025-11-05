@@ -169,6 +169,8 @@ pub struct LSPS4ServiceConfig {
 	/// larger than then the to-be-forwarded amount (i.e., client-requested amount minus the
 	/// channel opening fee fee).
 	pub channel_over_provisioning_ppm: u32,
+	/// The proportional fee, in millionths, skimmed from forwarded HTLCs.
+	pub forwarding_fee_proportional_millionths: u64,
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref + Clone>
@@ -281,8 +283,11 @@ where
 	}
 
 	pub(crate) fn lsps4_service(&mut self, service_config: LSPS4ServiceConfig) -> &mut Self {
-		let ldk_service_config =
-			LdkLSPS4ServiceConfig { cltv_expiry_delta: LSPS2_CHANNEL_CLTV_EXPIRY_DELTA };
+		let ldk_service_config = LdkLSPS4ServiceConfig {
+			cltv_expiry_delta: LSPS2_CHANNEL_CLTV_EXPIRY_DELTA,
+			forwarding_fee_proportional_millionths: service_config
+				.forwarding_fee_proportional_millionths,
+		};
 		self.lsps4_service = Some(LSPS4Service { service_config, ldk_service_config });
 		self
 	}
