@@ -26,11 +26,11 @@ use bdk_chain::bdk_core::spk_client::SyncRequest as BdkSyncRequest;
 use bdk_chain::bdk_core::spk_client::SyncResponse as BdkSyncResponse;
 use bdk_wallet::KeychainKind as BdkKeyChainKind;
 
+use bdk_electrum::electrum_client::Batch;
+use bdk_electrum::electrum_client::Client as ElectrumClient;
+use bdk_electrum::electrum_client::ConfigBuilder as ElectrumConfigBuilder;
+use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_electrum::BdkElectrumClient;
-
-use electrum_client::Client as ElectrumClient;
-use electrum_client::ConfigBuilder as ElectrumConfigBuilder;
-use electrum_client::{Batch, ElectrumApi};
 
 use bitcoin::{FeeRate, Network, Script, Transaction, Txid};
 
