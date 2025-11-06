@@ -13,12 +13,14 @@ use bdk_chain::bdk_core::spk_client::{
 	FullScanRequest as BdkFullScanRequest, FullScanResponse as BdkFullScanResponse,
 	SyncRequest as BdkSyncRequest, SyncResponse as BdkSyncResponse,
 };
+use bdk_electrum::electrum_client::Batch;
+use bdk_electrum::electrum_client::Client as ElectrumClient;
+use bdk_electrum::electrum_client::ConfigBuilder as ElectrumConfigBuilder;
+use bdk_electrum::electrum_client::ElectrumApi;
 use bdk_electrum::BdkElectrumClient;
 use bdk_wallet::{KeychainKind as BdkKeyChainKind, Update as BdkUpdate};
 use bitcoin::{FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
-use electrum_client::{
-	Batch, Client as ElectrumClient, ConfigBuilder as ElectrumConfigBuilder, ElectrumApi,
-};
+
 use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::util::ser::Writeable;
 use lightning_transaction_sync::ElectrumSyncClient;
