@@ -1380,6 +1380,7 @@ fn lsps4_client_service_integration() {
 		min_channel_size_msat,
 		channel_over_provisioning_ppm,
 		forwarding_fee_proportional_millionths: forwarding_fee_ppm,
+		channel_size_tiers: vec![],
 	};
 
 	let service_config = random_config(true);
@@ -1463,22 +1464,22 @@ fn lsps4_client_service_integration() {
 				outbound_amount_forwarded_msat,
 				..
 			} => {
-					assert_eq!(event_skimmed_fee_msat, Some(skimmed_fee_msat));
-					assert_eq!(outbound_amount_forwarded_msat, Some(expected_received_amount_msat));
-					eprintln!(
+				assert_eq!(event_skimmed_fee_msat, Some(skimmed_fee_msat));
+				assert_eq!(outbound_amount_forwarded_msat, Some(expected_received_amount_msat));
+				eprintln!(
 						"[lsps4-test] service forwarded payment; skimmed {} msat ({} sats), forwarded {} msat",
 						event_skimmed_fee_msat.unwrap(),
 						event_skimmed_fee_msat.unwrap() / 1000,
 						outbound_amount_forwarded_msat.unwrap()
 					);
-					saw_forwarded_event = true;
-					service_node.event_handled().unwrap();
-					break;
-				},
-				Event::SendWebhook { .. } => {
-					eprintln!("[lsps4-test] service received webhook notification request");
-					service_node.event_handled().unwrap();
-				},
+				saw_forwarded_event = true;
+				service_node.event_handled().unwrap();
+				break;
+			},
+			Event::SendWebhook { .. } => {
+				eprintln!("[lsps4-test] service received webhook notification request");
+				service_node.event_handled().unwrap();
+			},
 			other => {
 				panic!("Unexpected event on service node: {:?}", other);
 			},
@@ -1515,6 +1516,140 @@ fn lsps4_client_service_integration() {
 	let client_channels = client_node.list_channels();
 	assert_eq!(client_channels.len(), 1);
 	assert_eq!(client_channels[0].channel_value_sats, expected_channel_size_sat);
+}
+
+#[test]
+fn lsps4_channel_size_tiers_are_applied() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let sync_config = EsploraSyncConfig { background_sync_config: None };
+
+	let forwarding_fee_ppm = 0u64;
+	let lsps4_service_config = LSPS4ServiceConfig {
+		min_channel_size_msat: 10_000_000,
+		channel_over_provisioning_ppm: 0,
+		forwarding_fee_proportional_millionths: forwarding_fee_ppm,
+		channel_size_tiers: vec![100_000, 500_000, 1_000_000],
+	};
+
+	let service_config = random_config(true);
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.set_liquidity_provider_lsps4(lsps4_service_config);
+	let service_node = service_builder.build().unwrap();
+	service_node.start().unwrap();
+
+	let service_node_id = service_node.node_id();
+	let service_listen_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config(true);
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr);
+	let client_node = client_builder.build().unwrap();
+	client_node.start().unwrap();
+
+	let payer_config = random_config(true);
+	setup_builder!(payer_builder, payer_config.node_config);
+	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	let payer_node = payer_builder.build().unwrap();
+	payer_node.start().unwrap();
+
+	let service_onchain_addr = service_node.onchain_payment().new_address().unwrap();
+	let client_onchain_addr = client_node.onchain_payment().new_address().unwrap();
+	let payer_onchain_addr = payer_node.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 10_000_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![service_onchain_addr, client_onchain_addr, payer_onchain_addr],
+		Amount::from_sat(premine_amount_sat),
+	);
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+
+	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	service_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+	expect_channel_ready_event!(payer_node, service_node.node_id());
+	expect_channel_ready_event!(service_node, payer_node.node_id());
+
+	let expect_service_forward = |expected_forward_amount_msat: u64| loop {
+		match service_node.wait_next_event() {
+			Event::PaymentForwarded {
+				skimmed_fee_msat, outbound_amount_forwarded_msat, ..
+			} => {
+				assert_eq!(skimmed_fee_msat.unwrap_or(0), 0);
+				assert_eq!(outbound_amount_forwarded_msat, Some(expected_forward_amount_msat));
+				service_node.event_handled().unwrap();
+				break;
+			},
+			Event::SendWebhook { .. } => {
+				service_node.event_handled().unwrap();
+			},
+			other => panic!("unexpected service event: {:?}", other),
+		}
+	};
+
+	let mut expected_channel_values = Vec::new();
+	let mut pay_lsps4_invoice = |amount_sat: u64, expected_new_channel_value_sat: Option<u64>| {
+		let amount_msat = amount_sat * 1000;
+		let invoice_description = Bolt11InvoiceDescription::Direct(
+			Description::new(format!("lsps4 tier test {}", amount_sat)).unwrap(),
+		);
+		let invoice = client_node
+			.bolt11_payment()
+			.receive_via_lsps4_jit_channel(Some(amount_msat), &invoice_description, 1024)
+			.unwrap();
+		let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
+
+		if expected_new_channel_value_sat.is_some() {
+			expect_channel_pending_event!(service_node, client_node.node_id());
+			expect_channel_ready_event!(service_node, client_node.node_id());
+			expect_channel_pending_event!(client_node, service_node.node_id());
+			expect_channel_ready_event!(client_node, service_node.node_id());
+		}
+
+		expect_service_forward(amount_msat);
+		expect_payment_successful_event!(payer_node, Some(payment_id), None);
+		let client_payment_id = expect_payment_received_event!(client_node, amount_msat).unwrap();
+		let payment = client_node.payment(&client_payment_id).unwrap();
+		assert!(matches!(payment.kind, PaymentKind::Bolt11Jit { .. }));
+		assert_eq!(payment.amount_msat, Some(amount_msat));
+		assert_eq!(payment.status, PaymentStatus::Succeeded);
+
+		if let Some(channel_value_sat) = expected_new_channel_value_sat {
+			expected_channel_values.push(channel_value_sat);
+		}
+
+		let mut actual_channel_values: Vec<u64> = client_node
+			.list_channels()
+			.into_iter()
+			.filter(|chan| chan.counterparty_node_id == service_node.node_id())
+			.map(|chan| chan.channel_value_sats)
+			.collect();
+		actual_channel_values.sort_unstable();
+		let mut expected_sorted = expected_channel_values.clone();
+		expected_sorted.sort_unstable();
+		assert_eq!(actual_channel_values, expected_sorted);
+	};
+
+	pay_lsps4_invoice(50_000, Some(100_000));
+	pay_lsps4_invoice(100_000, Some(500_000));
+
+	for _ in 0..5 {
+		pay_lsps4_invoice(20_000, None);
+	}
+
+	pay_lsps4_invoice(400_000, Some(1_000_000));
+	pay_lsps4_invoice(100_000, None);
+	pay_lsps4_invoice(700_000, Some(1_000_000));
+	pay_lsps4_invoice(900_000, Some(1_000_000));
+
+	assert_eq!(expected_channel_values, vec![100_000, 500_000, 1_000_000, 1_000_000, 1_000_000]);
 }
 
 #[test]
