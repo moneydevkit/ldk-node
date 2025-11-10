@@ -184,6 +184,10 @@ pub struct LSPS4ServiceConfig {
 	pub channel_over_provisioning_ppm: u32,
 	/// The proportional fee, in millionths, skimmed from forwarded HTLCs.
 	pub forwarding_fee_proportional_millionths: u64,
+	/// Ordered list of target channel sizes in satoshis keyed by the number of currently open
+	/// channels with the peer. The first entry applies when there are no channels, the second
+	/// when there is already one, and so on. If empty, no tiering is applied.
+	pub channel_size_tiers: Vec<u64>,
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
@@ -1110,10 +1114,21 @@ where
 				let over_provisioning_msat = (amt_to_forward_msat
 					* service_config.channel_over_provisioning_ppm as u64)
 					/ 1_000_000;
-				let channel_amount_sats = std::cmp::max(
+				let mut channel_amount_sats = std::cmp::max(
 					(amt_to_forward_msat + over_provisioning_msat) / 1000,
 					service_config.min_channel_size_msat / 1000,
 				);
+				if !service_config.channel_size_tiers.is_empty() {
+					let tier_index = std::cmp::min(
+						channel_count,
+						service_config.channel_size_tiers.len() - 1,
+					);
+					if let Some(tier_value_sats) =
+						service_config.channel_size_tiers.get(tier_index).copied()
+					{
+						channel_amount_sats = channel_amount_sats.max(tier_value_sats);
+					}
+				}
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let spendable_amount_sats =
