@@ -1173,12 +1173,14 @@ where
 						&temporary_channel_id,
 						&counterparty_node_id,
 						user_channel_id,
+						None,
 					)
 				} else {
 					self.channel_manager.accept_inbound_channel(
 						&temporary_channel_id,
 						&counterparty_node_id,
 						user_channel_id,
+						None,
 					)
 				};
 
