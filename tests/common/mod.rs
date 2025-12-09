@@ -511,8 +511,20 @@ pub(crate) fn do_channel_full_cycle<E: ElectrumApi>(
 		vec![addr_a, addr_b],
 		Amount::from_sat(premine_amount_sat),
 	);
-	node_a.sync_wallets().unwrap();
-	node_b.sync_wallets().unwrap();
+	
+	// For BitcoindRpc, the initial sync might take a moment. Retry syncing and checking balances.
+	exponential_backoff_poll(|| {
+		node_a.sync_wallets().ok()?;
+		node_b.sync_wallets().ok()?;
+		let balance_a = node_a.list_balances().spendable_onchain_balance_sats;
+		let balance_b = node_b.list_balances().spendable_onchain_balance_sats;
+		if balance_a == premine_amount_sat && balance_b == premine_amount_sat {
+			Some(())
+		} else {
+			None
+		}
+	});
+	
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
