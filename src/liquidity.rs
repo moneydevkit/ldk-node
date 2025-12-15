@@ -795,6 +795,7 @@ where
 				// TODO: revisit this decision eventually.
 				config.channel_config.forwarding_fee_base_msat = 0;
 				config.channel_config.forwarding_fee_proportional_millionths = 0;
+				config.channel_handshake_config.min_their_channel_reserve_satoshis = 0;
 
 				match self.channel_manager.create_channel(
 					their_network_key,
@@ -1079,6 +1080,7 @@ where
 				// TODO: revisit this decision eventually.
 				config.channel_config.forwarding_fee_base_msat = 0;
 				config.channel_config.forwarding_fee_proportional_millionths = 0;
+				config.channel_handshake_config.min_their_channel_reserve_satoshis = 0;
 
 				// TODO: does LSPS4 service need to track this? seems like no?
 				let user_channel_id = 0;
