@@ -25,11 +25,12 @@ use lightning::ln::msgs::DecodeError;
 use lightning::routing::gossip::NetworkGraph;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
 use lightning::util::persist::{
-	KVSTORE_NAMESPACE_KEY_ALPHABET, KVSTORE_NAMESPACE_KEY_MAX_LEN, NETWORK_GRAPH_PERSISTENCE_KEY,
-	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
-	OUTPUT_SWEEPER_PERSISTENCE_KEY, OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
-	OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
-	SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+	KVSTORE_NAMESPACE_KEY_ALPHABET, KVSTORE_NAMESPACE_KEY_MAX_LEN,
+	NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+	NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::{Readable, ReadableArgs, Writeable};
 use lightning::util::string::PrintableString;
@@ -203,33 +204,59 @@ where
 }
 
 /// Read previously persisted payments information from the store.
-pub(crate) fn read_payments<L: Deref>(
+pub(crate) fn read_payments<L: Deref + Clone + Send>(
 	kv_store: Arc<DynStore>, logger: L,
 ) -> Result<Vec<PaymentDetails>, std::io::Error>
 where
 	L::Target: LdkLogger,
 {
-	let mut res = Vec::new();
-
-	for stored_key in kv_store.list(
+	let keys = kv_store.list(
 		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 		PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-	)? {
-		let mut reader = Cursor::new(kv_store.read(
-			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
-			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-			&stored_key,
-		)?);
-		let payment = PaymentDetails::read(&mut reader).map_err(|e| {
-			log_error!(logger, "Failed to deserialize PaymentDetails: {}", e);
-			std::io::Error::new(
-				std::io::ErrorKind::InvalidData,
-				"Failed to deserialize PaymentDetails",
-			)
-		})?;
-		res.push(payment);
-	}
-	Ok(res)
+	)?;
+
+	// Read all payments in parallel using scoped threads.
+	// This significantly improves performance for network-backed stores like VSS,
+	// where sequential reads would incur per-key network latency.
+	let results: Vec<Result<PaymentDetails, std::io::Error>> = std::thread::scope(|s| {
+		let handles: Vec<_> = keys
+			.iter()
+			.map(|key| {
+				let kv_store = Arc::clone(&kv_store);
+				let logger = logger.clone();
+				s.spawn(move || {
+					let mut reader = Cursor::new(kv_store.read(
+						PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+						PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+						key,
+					)?);
+					PaymentDetails::read(&mut reader).map_err(|e| {
+						log_error!(logger, "Failed to deserialize PaymentDetails: {}", e);
+						std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"Failed to deserialize PaymentDetails",
+						)
+					})
+				})
+			})
+			.collect();
+
+		handles
+			.into_iter()
+			.map(|h| {
+				h.join()
+					.map_err(|_| {
+						std::io::Error::new(
+							std::io::ErrorKind::Other,
+							"Thread panicked while reading payment",
+						)
+					})
+					.and_then(|r| r)
+			})
+			.collect()
+	});
+
+	results.into_iter().collect()
 }
 
 /// Read `OutputSweeper` state from the store.
