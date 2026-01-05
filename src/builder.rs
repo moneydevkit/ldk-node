@@ -19,7 +19,7 @@ use bip39::Mnemonic;
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Network};
-use bdk_chain::{BlockId, TxUpdate};
+use bitcoin_payment_instructions::onion_message_resolver::LDKOnionMessageDNSSECHrnResolver;
 use lightning::chain::{chainmonitor, BestBlock, Watch};
 use lightning::io::Cursor;
 use lightning::ln::channelmanager::{self, ChainParameters, ChannelManagerReadArgs};
