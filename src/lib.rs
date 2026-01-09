@@ -281,7 +281,7 @@ impl Node {
 						}
 						_ = interval.tick() => {
 							let now = Instant::now();
-							match gossip_source.update_rgs_snapshot().await {
+							match gossip_source.update_rgs_snapshot(false).await {
 								Ok(updated_timestamp) => {
 									log_info!(
 										gossip_sync_logger,
@@ -1467,6 +1467,24 @@ impl Node {
 			let _ = sync_sweeper.regenerate_and_broadcast_spend_if_necessary().await;
 			Ok(())
 		})
+	}
+
+	/// Manually sync the RGS snapshot.
+	///
+	/// If `do_full_sync` is true, the RGS snapshot will be updated from scratch. Otherwise, the
+	/// snapshot will be updated from the last known sync point.
+	pub async fn sync_rgs(&self, do_full_sync: bool) -> Result<u32, Error> {
+		let updated_timestamp = self.gossip_source.update_rgs_snapshot(do_full_sync).await?;
+
+		let mut locked_node_metrics = self.node_metrics.write().unwrap();
+		locked_node_metrics.latest_rgs_snapshot_timestamp = Some(updated_timestamp);
+		write_node_metrics(
+			&*locked_node_metrics,
+			Arc::clone(&self.kv_store),
+			Arc::clone(&self.logger),
+		)?;
+
+		Ok(updated_timestamp)
 	}
 
 	/// Close a previously opened channel.
