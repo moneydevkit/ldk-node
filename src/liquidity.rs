@@ -480,10 +480,10 @@ where
 		self.lsps4_client.as_ref().map(|s| (s.lsp_node_id, s.lsp_address.clone()))
 	}
 
-	pub(crate) fn handle_expired_htlcs(&self) {
+	pub(crate) async fn handle_expired_htlcs(&self) {
 		if let Some(lsps4_service_handler) = self.liquidity_manager.lsps4_service_handler() {
 			let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-			lsps4_service_handler.handle_expired_htlcs(now);
+			lsps4_service_handler.handle_expired_htlcs(now).await;
 		}
 	}
 

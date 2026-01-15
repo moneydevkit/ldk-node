@@ -635,7 +635,7 @@ impl Node {
 							return;
 						}
 						_ = tokio::time::sleep(Duration::from_secs(HTLC_EXPIRY_CHECK_INTERVAL_SECS)) => {
-								liquidity_handler.handle_expired_htlcs();
+								liquidity_handler.handle_expired_htlcs().await;
 						}
 						_ = liquidity_handler.handle_next_event() => {}
 					}
