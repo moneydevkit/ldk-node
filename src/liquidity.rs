@@ -1758,7 +1758,6 @@ where
 		if let Some(lsps4_service_handler) = self.liquidity_manager.lsps4_service_handler() {
 			if let Err(e) = lsps4_service_handler
 				.channel_ready(counterparty_node_id)
-				.await
 			{
 				log_error!(
 					self.logger,
@@ -1797,8 +1796,7 @@ where
 				intercept_id,
 				expected_outbound_amount_msat,
 				payment_hash,
-				)
-				.await 
+				) 
 			{
 				log_error!(
 					self.logger,
