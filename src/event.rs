@@ -417,6 +417,13 @@ where
 		})?;
 		Ok(())
 	}
+
+	fn contains_payment_received(&self, payment_id: &PaymentId) -> bool {
+		let locked_queue = self.queue.lock().unwrap();
+		locked_queue.iter().any(|event| {
+			matches!(event, Event::PaymentReceived { payment_id: Some(id), .. } if id == payment_id)
+		})
+	}
 }
 
 impl<L: Deref> ReadableArgs<(Arc<DynStore>, L)> for EventQueue<L>
@@ -1008,6 +1015,18 @@ where
 						);
 						return Err(ReplayEvent());
 					},
+				}
+
+				// Check if a PaymentReceived event for this payment already exists in the queue.
+				// This handles the case where PaymentClaimed is replayed on restart - we only
+				// want to queue one PaymentReceived event per payment.
+				if self.event_queue.contains_payment_received(&payment_id) {
+					log_debug!(
+						self.logger,
+						"Skipping duplicate PaymentReceived for payment {}: event already queued",
+						payment_id,
+					);
+					return Ok(());
 				}
 
 				let event = Event::PaymentReceived {
