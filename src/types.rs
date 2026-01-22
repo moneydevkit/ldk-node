@@ -9,7 +9,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin_payment_instructions::onion_message_resolver::LDKOnionMessageDNSSECHrnResolver;
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
