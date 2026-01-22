@@ -92,8 +92,8 @@ log = { version = "0.4.22", default-features = false, features = ["std"]}
 
 vss-client = { package = "vss-client-ng", version = "0.4" }
 prost = { version = "0.11.6", default-features = false}
-#bitcoin-payment-instructions = { version = "0.6" }
-bitcoin-payment-instructions = { git = "https://github.com/tnull/bitcoin-payment-instructions", branch = "2025-12-ldk-node-base" }
+# Branch: https://github.com/moneydevkit/bitcoin-payment-instructions/tree/2025-12-ldk-node-base
+bitcoin-payment-instructions = { git = "https://github.com/moneydevkit/bitcoin-payment-instructions", rev = "6796e87525d6c564e1332354a808730e2ba2ebf8" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase"] }
