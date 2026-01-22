@@ -220,6 +220,8 @@ impl Node {
 	/// After this returns, the [`Node`] instance can be controlled via the provided API methods in
 	/// a thread-safe manner.
 	pub fn start(&self) -> Result<(), Error> {
+		let fn_start = Instant::now();
+
 		// Acquire a run lock and hold it until we're setup.
 		let mut is_running_lock = self.is_running.write().unwrap();
 		if *is_running_lock {
@@ -234,14 +236,18 @@ impl Node {
 		);
 
 		// Start up any runtime-dependant chain sources (e.g. Electrum)
+		let step_start = Instant::now();
 		self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
 			log_error!(self.logger, "Failed to start chain syncing: {}", e);
 			e
 		})?;
+		log_info!(self.logger, "TIMING: chain_source.start() took {}ms", step_start.elapsed().as_millis());
 
 		// Block to ensure we update our fee rate cache once on startup
+		let step_start = Instant::now();
 		let chain_source = Arc::clone(&self.chain_source);
 		self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
+		log_info!(self.logger, "TIMING: update_fee_rate_estimates() took {}ms", step_start.elapsed().as_millis());
 
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
@@ -643,6 +649,7 @@ impl Node {
 			});
 		}
 
+		log_info!(self.logger, "TIMING: start() TOTAL took {}ms", fn_start.elapsed().as_millis());
 		log_info!(self.logger, "Startup complete.");
 		*is_running_lock = true;
 		Ok(())
@@ -1437,6 +1444,9 @@ impl Node {
 	///
 	/// [`EsploraSyncConfig::background_sync_config`]: crate::config::EsploraSyncConfig::background_sync_config
 	pub fn sync_wallets(&self) -> Result<(), Error> {
+		let fn_start = Instant::now();
+		log_info!(self.logger, "TIMING: sync_wallets() START");
+
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
@@ -1446,15 +1456,28 @@ impl Node {
 		let sync_cman = Arc::clone(&self.channel_manager);
 		let sync_cmon = Arc::clone(&self.chain_monitor);
 		let sync_sweeper = Arc::clone(&self.output_sweeper);
+		let logger = Arc::clone(&self.logger);
 		self.runtime.block_on(async move {
 			if chain_source.is_transaction_based() {
+				let step_start = Instant::now();
 				chain_source.update_fee_rate_estimates().await?;
+				log_info!(logger, "TIMING: sync_wallets update_fee_rate_estimates() took {}ms", step_start.elapsed().as_millis());
+
+				let step_start = Instant::now();
 				chain_source
 					.sync_lightning_wallet(sync_cman, sync_cmon, Arc::clone(&sync_sweeper))
 					.await?;
+				log_info!(logger, "TIMING: sync_wallets sync_lightning_wallet() took {}ms", step_start.elapsed().as_millis());
+
+				let step_start = Instant::now();
 				chain_source.sync_onchain_wallet(sync_wallet).await?;
+				log_info!(logger, "TIMING: sync_wallets sync_onchain_wallet() took {}ms", step_start.elapsed().as_millis());
 			} else {
+				let step_start = Instant::now();
 				chain_source.update_fee_rate_estimates().await?;
+				log_info!(logger, "TIMING: sync_wallets update_fee_rate_estimates() took {}ms", step_start.elapsed().as_millis());
+
+				let step_start = Instant::now();
 				chain_source
 					.poll_and_update_listeners(
 						sync_wallet,
@@ -1463,8 +1486,12 @@ impl Node {
 						Arc::clone(&sync_sweeper),
 					)
 					.await?;
+				log_info!(logger, "TIMING: sync_wallets poll_and_update_listeners() took {}ms", step_start.elapsed().as_millis());
 			}
+			let step_start = Instant::now();
 			let _ = sync_sweeper.regenerate_and_broadcast_spend_if_necessary().await;
+			log_info!(logger, "TIMING: sync_wallets regenerate_and_broadcast_spend_if_necessary() took {}ms", step_start.elapsed().as_millis());
+			log_info!(logger, "TIMING: sync_wallets() TOTAL took {}ms", fn_start.elapsed().as_millis());
 			Ok(())
 		})
 	}

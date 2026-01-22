@@ -10,6 +10,7 @@
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -93,6 +94,9 @@ impl Bolt11Payment {
 	pub fn send(
 		&self, invoice: &Bolt11Invoice, route_parameters: Option<RouteParametersConfig>,
 	) -> Result<PaymentId, Error> {
+		let fn_start = Instant::now();
+		log_info!(self.logger, "TIMING: bolt11_payment.send() START");
+
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
@@ -114,6 +118,7 @@ impl Bolt11Payment {
 		let retry_strategy = Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT);
 		let payment_secret = Some(*invoice.payment_secret());
 
+		let step_start = Instant::now();
 		match self.channel_manager.pay_for_bolt11_invoice(
 			invoice,
 			payment_id,
@@ -122,6 +127,7 @@ impl Bolt11Payment {
 			retry_strategy,
 		) {
 			Ok(()) => {
+				log_info!(self.logger, "TIMING: bolt11_payment.send() channel_manager.pay_for_bolt11_invoice() took {}ms", step_start.elapsed().as_millis());
 				let payee_pubkey = invoice.recover_payee_pub_key();
 				let amt_msat = invoice.amount_milli_satoshis().unwrap();
 				log_info!(self.logger, "Initiated sending {}msat to {}", amt_msat, payee_pubkey);
@@ -142,6 +148,7 @@ impl Bolt11Payment {
 
 				self.payment_store.insert(payment)?;
 
+				log_info!(self.logger, "TIMING: bolt11_payment.send() TOTAL took {}ms", fn_start.elapsed().as_millis());
 				Ok(payment_id)
 			},
 			Err(Bolt11PaymentError::InvalidAmount) => {
@@ -752,6 +759,9 @@ impl Bolt11Payment {
 	pub fn receive_via_lsps4_jit_channel(
 		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
+		let fn_start = Instant::now();
+		log_info!(self.logger, "TIMING: receive_via_lsps4_jit_channel() START amount_msat={:?}", amount_msat);
+
 		let description = maybe_try_convert_enum(description)?;
 
 		let liquidity_source =
@@ -768,24 +778,29 @@ impl Bolt11Payment {
 
 		// We need to use our main runtime here as a local runtime might not be around to poll
 		// connection futures going forward.
+		let step_start = Instant::now();
 		self.runtime.block_on(async move {
 			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
+		log_info!(self.logger, "TIMING: receive_via_lsps4_jit_channel() connect_peer_if_necessary() took {}ms", step_start.elapsed().as_millis());
 
 		log_info!(self.logger, "Connected to LSP {}@{}. ", peer_info.node_id, peer_info.address);
 
+		let step_start = Instant::now();
 		let liquidity_source = Arc::clone(&liquidity_source);
 		let invoice = self.runtime.block_on(async move {
 			liquidity_source
 				.lsps4_receive_to_jit_channel(amount_msat, &description, expiry_secs)
 				.await
 		})?;
+		log_info!(self.logger, "TIMING: receive_via_lsps4_jit_channel() lsps4_receive_to_jit_channel() took {}ms", step_start.elapsed().as_millis());
 
 		self.register_lsps4_payment(&invoice, amount_msat)?;
 
 		// Persist LSP peer to make sure we reconnect on restart.
 		self.peer_store.add_peer(peer_info)?;
 
+		log_info!(self.logger, "TIMING: receive_via_lsps4_jit_channel() TOTAL took {}ms", fn_start.elapsed().as_millis());
 		Ok(maybe_wrap(invoice))
 	}
 

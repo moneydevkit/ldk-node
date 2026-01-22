@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
@@ -1637,6 +1637,9 @@ where
 	}
 
 	async fn lsps4_register_node(&self) -> Result<LSPS4RegisterNodeResponse, Error> {
+		let fn_start = Instant::now();
+		log_info!(self.logger, "TIMING: lsps4_register_node() START");
+
 		let lsps4_client = self.lsps4_client.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
 
 		let client_handler = self.liquidity_manager.lsps4_client_handler().ok_or_else(|| {
@@ -1651,8 +1654,9 @@ where
 			let request_id = client_handler.register_node(lsps4_client.lsp_node_id).unwrap();
 			pending_register_node_requests_lock.insert(request_id, register_node_sender);
 		}
+		log_info!(self.logger, "TIMING: lsps4_register_node() sent request, waiting for response...");
 
-		tokio::time::timeout(
+		let result = tokio::time::timeout(
 			Duration::from_secs(LIQUIDITY_REQUEST_TIMEOUT_SECS),
 			register_node_receiver,
 		)
@@ -1664,14 +1668,23 @@ where
 		.map_err(|e| {
 			log_error!(self.logger, "Failed to handle response from liquidity service: {}", e);
 			Error::LiquidityRequestFailed
-		})
+		});
+
+		log_info!(self.logger, "TIMING: lsps4_register_node() TOTAL took {}ms", fn_start.elapsed().as_millis());
+		result
 	}
 
 	pub(crate) async fn lsps4_receive_to_jit_channel(
 		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
-		let register_node_response = self.lsps4_register_node().await?;
+		let fn_start = Instant::now();
+		log_info!(self.logger, "TIMING: lsps4_receive_to_jit_channel() START amount_msat={:?}", amount_msat);
 
+		let step_start = Instant::now();
+		let register_node_response = self.lsps4_register_node().await?;
+		log_info!(self.logger, "TIMING: lsps4_receive_to_jit_channel() lsps4_register_node() took {}ms", step_start.elapsed().as_millis());
+
+		let step_start = Instant::now();
 		let invoice = self.lsps4_create_jit_invoice(
 			register_node_response.intercept_scid,
 			register_node_response.cltv_expiry_delta,
@@ -1679,7 +1692,9 @@ where
 			description,
 			expiry_secs,
 		)?;
+		log_info!(self.logger, "TIMING: lsps4_receive_to_jit_channel() lsps4_create_jit_invoice() took {}ms", step_start.elapsed().as_millis());
 
+		log_info!(self.logger, "TIMING: lsps4_receive_to_jit_channel() TOTAL took {}ms", fn_start.elapsed().as_millis());
 		log_info!(self.logger, "LSPS4 JIT-channel invoice created: {}", invoice);
 		Ok(invoice)
 	}
