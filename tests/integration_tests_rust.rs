@@ -8,64 +8,42 @@
 mod common;
 
 use common::{
-	do_channel_full_cycle, expect_channel_pending_event, expect_channel_ready_event, expect_event,
-	expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait,
-	logging::{init_log_logger, validate_log_entry, TestLogWriter},
-	open_channel, premine_and_distribute_funds, random_config, random_listening_addresses,
-	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, wait_for_tx,
-	TestChainSource, TestSyncStore,
-};
-
-use ldk_node::config::EsploraSyncConfig;
-use ldk_node::liquidity::{LSPS2ServiceConfig, LSPS4ServiceConfig};
-use ldk_node::payment::{
-	ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus, QrPaymentResult,
-	SendingParameters,
-};
-use ldk_node::{Builder, Event, NodeError};
-
-use lightning::ln::channelmanager::PaymentId;
-use lightning::routing::gossip::{NodeAlias, NodeId};
-use lightning::util::persist::KVStore;
-
-use lightning_invoice::{Bolt11InvoiceDescription, Description};
-
-use bitcoin::address::NetworkUnchecked;
-use bitcoin::hashes::Hash;
-use bitcoin::Address;
-use bitcoin::Amount;
-use log::LevelFilter;
-
-use std::str::FromStr;
-use std::sync::Arc;
-
-use bitcoin::address::NetworkUnchecked;
-use bitcoin::hashes::sha256::Hash as Sha256Hash;
-use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, ScriptBuf};
-use common::logging::{init_log_logger, validate_log_entry, MultiNodeLogger, TestLogWriter};
-use common::{
 	bump_fee_and_broadcast, distribute_funds_unconfirmed, do_channel_full_cycle,
 	expect_channel_pending_event, expect_channel_ready_event, expect_event,
 	expect_payment_claimable_event, expect_payment_received_event, expect_payment_successful_event,
-	expect_splice_pending_event, generate_blocks_and_wait, open_channel, open_channel_push_amt,
-	premine_and_distribute_funds, premine_blocks, prepare_rbf, random_config,
-	random_listening_addresses, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_node_for_async_payments, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
+	expect_splice_pending_event, generate_blocks_and_wait,
+	logging::{init_log_logger, validate_log_entry, MultiNodeLogger, TestLogWriter},
+	open_channel, open_channel_push_amt, premine_and_distribute_funds, premine_blocks, prepare_rbf,
+	random_config, random_listening_addresses, setup_bitcoind_and_electrsd, setup_builder,
+	setup_node, setup_node_for_async_payments, setup_two_nodes, wait_for_tx, TestChainSource,
+	TestSyncStore,
 };
+
 use ldk_node::config::{AsyncPaymentsRole, EsploraSyncConfig};
-use ldk_node::liquidity::LSPS2ServiceConfig;
+use ldk_node::liquidity::{LSPS2ServiceConfig, LSPS4ServiceConfig};
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 	QrPaymentResult,
 };
 use ldk_node::{Builder, DynStore, Event, NodeError};
+
 use lightning::ln::channelmanager::PaymentId;
 use lightning::routing::gossip::{NodeAlias, NodeId};
 use lightning::routing::router::RouteParametersConfig;
+
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
+
+use bitcoin::address::NetworkUnchecked;
+use bitcoin::hashes::sha256::Hash as Sha256Hash;
+use bitcoin::hashes::Hash;
+use bitcoin::{Address, Amount, ScriptBuf};
+
 use log::LevelFilter;
+
+use std::collections::HashSet;
+use std::str::FromStr;
+use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn channel_full_cycle() {
@@ -1934,8 +1912,8 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	assert_eq!(client_node.payment(&payment_id).unwrap().status, PaymentStatus::Failed);
 }
 
-#[test]
-fn lsps4_client_service_integration() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps4_client_service_integration() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
@@ -1987,15 +1965,16 @@ fn lsps4_client_service_integration() {
 		&electrsd.client,
 		vec![service_onchain_addr, client_onchain_addr, payer_onchain_addr],
 		Amount::from_sat(premine_amount_sat),
-	);
+	)
+	.await;
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
 
 	// Open a channel payer -> service so the payer can reach the client through the LSP.
-	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd);
+	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd).await;
 
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
 	expect_channel_ready_event!(payer_node, service_node.node_id());
@@ -2088,8 +2067,8 @@ fn lsps4_client_service_integration() {
 	assert_eq!(client_channels[0].channel_value_sats, expected_channel_size_sat);
 }
 
-#[test]
-fn lsps4_channel_size_tiers_are_applied() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps4_channel_size_tiers_are_applied() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 	let sync_config = EsploraSyncConfig { background_sync_config: None };
@@ -2135,13 +2114,14 @@ fn lsps4_channel_size_tiers_are_applied() {
 		&electrsd.client,
 		vec![service_onchain_addr, client_onchain_addr, payer_onchain_addr],
 		Amount::from_sat(premine_amount_sat),
-	);
+	)
+	.await;
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
 
-	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd);
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
 	expect_channel_ready_event!(payer_node, service_node.node_id());
@@ -2165,59 +2145,64 @@ fn lsps4_channel_size_tiers_are_applied() {
 	};
 
 	let mut expected_channel_values = Vec::new();
-	let mut pay_lsps4_invoice = |amount_sat: u64, expected_new_channel_value_sat: Option<u64>| {
-		let amount_msat = amount_sat * 1000;
-		let invoice_description = Bolt11InvoiceDescription::Direct(
-			Description::new(format!("lsps4 tier test {}", amount_sat)).unwrap(),
-		);
-		let invoice = client_node
-			.bolt11_payment()
-			.receive_via_lsps4_jit_channel(Some(amount_msat), &invoice_description, 1024)
-			.unwrap();
-		let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
 
-		if expected_new_channel_value_sat.is_some() {
-			expect_channel_pending_event!(service_node, client_node.node_id());
-			expect_channel_ready_event!(service_node, client_node.node_id());
-			expect_channel_pending_event!(client_node, service_node.node_id());
-			expect_channel_ready_event!(client_node, service_node.node_id());
-		}
+	macro_rules! pay_lsps4_invoice {
+		($amount_sat:expr, $expected_new_channel_value_sat:expr) => {{
+			let amount_sat = $amount_sat;
+			let expected_new_channel_value_sat = $expected_new_channel_value_sat;
+			let amount_msat = amount_sat * 1000;
+			let invoice_description = Bolt11InvoiceDescription::Direct(
+				Description::new(format!("lsps4 tier test {}", amount_sat)).unwrap(),
+			);
+			let invoice = client_node
+				.bolt11_payment()
+				.receive_via_lsps4_jit_channel(Some(amount_msat), &invoice_description, 1024)
+				.unwrap();
+			let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
 
-		expect_service_forward(amount_msat);
-		expect_payment_successful_event!(payer_node, Some(payment_id), None);
-		let client_payment_id = expect_payment_received_event!(client_node, amount_msat).unwrap();
-		let payment = client_node.payment(&client_payment_id).unwrap();
-		assert!(matches!(payment.kind, PaymentKind::Bolt11Jit { .. }));
-		assert_eq!(payment.amount_msat, Some(amount_msat));
-		assert_eq!(payment.status, PaymentStatus::Succeeded);
+			if expected_new_channel_value_sat.is_some() {
+				expect_channel_pending_event!(service_node, client_node.node_id());
+				expect_channel_ready_event!(service_node, client_node.node_id());
+				expect_channel_pending_event!(client_node, service_node.node_id());
+				expect_channel_ready_event!(client_node, service_node.node_id());
+			}
 
-		if let Some(channel_value_sat) = expected_new_channel_value_sat {
-			expected_channel_values.push(channel_value_sat);
-		}
+			expect_service_forward(amount_msat);
+			expect_payment_successful_event!(payer_node, Some(payment_id), None);
+			let client_payment_id = expect_payment_received_event!(client_node, amount_msat).unwrap();
+			let payment = client_node.payment(&client_payment_id).unwrap();
+			assert!(matches!(payment.kind, PaymentKind::Bolt11Jit { .. }));
+			assert_eq!(payment.amount_msat, Some(amount_msat));
+			assert_eq!(payment.status, PaymentStatus::Succeeded);
 
-		let mut actual_channel_values: Vec<u64> = client_node
-			.list_channels()
-			.into_iter()
-			.filter(|chan| chan.counterparty_node_id == service_node.node_id())
-			.map(|chan| chan.channel_value_sats)
-			.collect();
-		actual_channel_values.sort_unstable();
-		let mut expected_sorted = expected_channel_values.clone();
-		expected_sorted.sort_unstable();
-		assert_eq!(actual_channel_values, expected_sorted);
-	};
+			if let Some(channel_value_sat) = expected_new_channel_value_sat {
+				expected_channel_values.push(channel_value_sat);
+			}
 
-	pay_lsps4_invoice(50_000, Some(100_000));
-	pay_lsps4_invoice(100_000, Some(500_000));
-
-	for _ in 0..5 {
-		pay_lsps4_invoice(20_000, None);
+			let mut actual_channel_values: Vec<u64> = client_node
+				.list_channels()
+				.into_iter()
+				.filter(|chan| chan.counterparty_node_id == service_node.node_id())
+				.map(|chan| chan.channel_value_sats)
+				.collect();
+			actual_channel_values.sort_unstable();
+			let mut expected_sorted = expected_channel_values.clone();
+			expected_sorted.sort_unstable();
+			assert_eq!(actual_channel_values, expected_sorted);
+		}};
 	}
 
-	pay_lsps4_invoice(400_000, Some(1_000_000));
-	pay_lsps4_invoice(100_000, None);
-	pay_lsps4_invoice(700_000, Some(1_000_000));
-	pay_lsps4_invoice(900_000, Some(1_000_000));
+	pay_lsps4_invoice!(50_000, Some(100_000));
+	pay_lsps4_invoice!(100_000, Some(500_000));
+
+	for _ in 0..5 {
+		pay_lsps4_invoice!(20_000, None);
+	}
+
+	pay_lsps4_invoice!(400_000, Some(1_000_000));
+	pay_lsps4_invoice!(100_000, None);
+	pay_lsps4_invoice!(700_000, Some(1_000_000));
+	pay_lsps4_invoice!(900_000, Some(1_000_000));
 
 	assert_eq!(expected_channel_values, vec![100_000, 500_000, 1_000_000, 1_000_000, 1_000_000]);
 }
