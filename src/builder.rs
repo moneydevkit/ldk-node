@@ -740,8 +740,15 @@ impl NodeBuilder {
 	pub fn build_with_vss_store_and_header_provider(
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
-		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		use std::time::Instant;
+		let build_start = Instant::now();
+		eprintln!("TIMING: [ldk-node] build_with_vss_store_and_header_provider START");
 
+		let step_start = Instant::now();
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		eprintln!("TIMING: [ldk-node] setup_logger() took {}ms", step_start.elapsed().as_millis());
+
+		let step_start = Instant::now();
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
@@ -750,30 +757,38 @@ impl NodeBuilder {
 				BuildError::RuntimeSetupFailed
 			})?)
 		};
+		eprintln!("TIMING: [ldk-node] runtime setup took {}ms", step_start.elapsed().as_millis());
 
+		let step_start = Instant::now();
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
 			self.entropy_source_config.as_ref(),
 			Arc::clone(&logger),
 		)?;
+		eprintln!("TIMING: [ldk-node] seed_bytes_from_config() took {}ms", step_start.elapsed().as_millis());
 
 		let config = Arc::new(self.config.clone());
 
+		let step_start = Instant::now();
 		let vss_xprv = derive_xprv(
 			config.clone(),
 			&seed_bytes,
 			VSS_HARDENED_CHILD_INDEX,
 			Arc::clone(&logger),
 		)?;
+		eprintln!("TIMING: [ldk-node] derive_xprv() took {}ms", step_start.elapsed().as_millis());
 
 		let vss_seed_bytes: [u8; 32] = vss_xprv.private_key.secret_bytes();
 
+		let step_start = Instant::now();
 		let vss_store =
 			VssStore::new(vss_url, store_id, vss_seed_bytes, header_provider).map_err(|e| {
 				log_error!(logger, "Failed to setup VSS store: {}", e);
 				BuildError::KVStoreSetupFailed
 			})?;
+		eprintln!("TIMING: [ldk-node] VssStore::new() took {}ms", step_start.elapsed().as_millis());
 
+		eprintln!("TIMING: [ldk-node] build_with_vss_store_and_header_provider pre-internal took {}ms", build_start.elapsed().as_millis());
 		build_with_store_internal(
 			config,
 			self.chain_data_source_config.as_ref(),
@@ -1215,7 +1230,13 @@ fn build_with_store_internal(
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
 	logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
+	use std::time::Instant;
+	let build_start = Instant::now();
+	eprintln!("TIMING: [ldk-node] build_with_store_internal START");
+
+	let step_start = Instant::now();
 	optionally_install_rustls_cryptoprovider();
+	eprintln!("TIMING: [ldk-node] optionally_install_rustls_cryptoprovider() took {}ms", step_start.elapsed().as_millis());
 
 	if let Err(err) = may_announce_channel(&config) {
 		if config.announcement_addresses.is_some() {
@@ -1235,6 +1256,7 @@ fn build_with_store_internal(
 	}
 
 	// Initialize the status fields.
+	let step_start = Instant::now();
 	let node_metrics = match runtime
 		.block_on(async { read_node_metrics(Arc::clone(&kv_store), Arc::clone(&logger)).await })
 	{
@@ -1248,9 +1270,12 @@ fn build_with_store_internal(
 			}
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_node_metrics() took {}ms", step_start.elapsed().as_millis());
+
 	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
+	let step_start = Instant::now();
 	let payment_store = match runtime
 		.block_on(async { read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).await })
 	{
@@ -1266,7 +1291,9 @@ fn build_with_store_internal(
 			return Err(BuildError::ReadFailed);
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_payments() took {}ms", step_start.elapsed().as_millis());
 
+	let step_start = Instant::now();
 	let (chain_source, chain_tip_opt) = match chain_data_source_config {
 		Some(ChainDataSourceConfig::Esplora { server_url, headers, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
@@ -1352,9 +1379,11 @@ fn build_with_store_internal(
 			)
 		},
 	};
+	eprintln!("TIMING: [ldk-node] chain_source setup took {}ms", step_start.elapsed().as_millis());
 	let chain_source = Arc::new(chain_source);
 
 	// Initialize the on-chain wallet and chain access
+	let step_start = Instant::now();
 	let xprv = bitcoin::bip32::Xpriv::new_master(config.network, &seed_bytes).map_err(|e| {
 		log_error!(logger, "Failed to derive master secret: {}", e);
 		BuildError::InvalidSeedBytes
@@ -1428,6 +1457,7 @@ fn build_with_store_internal(
 		Arc::clone(&config),
 		Arc::clone(&logger),
 	));
+	eprintln!("TIMING: [ldk-node] wallet setup (BDK) took {}ms", step_start.elapsed().as_millis());
 
 	// Initialize the KeysManager
 	let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {
@@ -1456,6 +1486,7 @@ fn build_with_store_internal(
 	));
 
 	// Read ChannelMonitor state from store
+	let step_start = Instant::now();
 	let channel_monitors = match persister.read_all_channel_monitors_with_updates() {
 		Ok(monitors) => monitors,
 		Err(e) => {
@@ -1467,6 +1498,7 @@ fn build_with_store_internal(
 			}
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_all_channel_monitors_with_updates() took {}ms", step_start.elapsed().as_millis());
 
 	// Initialize the ChainMonitor
 	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
@@ -1480,6 +1512,7 @@ fn build_with_store_internal(
 	));
 
 	// Initialize the network graph, scorer, and router
+	let step_start = Instant::now();
 	let network_graph = match runtime
 		.block_on(async { read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)).await })
 	{
@@ -1493,7 +1526,9 @@ fn build_with_store_internal(
 			}
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_network_graph() took {}ms", step_start.elapsed().as_millis());
 
+	let step_start = Instant::now();
 	let local_scorer = match runtime.block_on(async {
 		read_scorer(Arc::clone(&kv_store), Arc::clone(&network_graph), Arc::clone(&logger)).await
 	}) {
@@ -1510,6 +1545,7 @@ fn build_with_store_internal(
 	};
 
 	let scorer = Arc::new(Mutex::new(CombinedScorer::new(local_scorer)));
+	eprintln!("TIMING: [ldk-node] read_scorer() took {}ms", step_start.elapsed().as_millis());
 
 	// Restore external pathfinding scores from cache if possible.
 	match runtime.block_on(async {
@@ -1588,6 +1624,7 @@ fn build_with_store_internal(
 		Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
 
 	// Initialize the ChannelManager
+	let step_start = Instant::now();
 	let channel_manager = {
 		if let Ok(res) = KVStoreSync::read(
 			&*kv_store,
@@ -1639,6 +1676,7 @@ fn build_with_store_internal(
 			)
 		}
 	};
+	eprintln!("TIMING: [ldk-node] channel_manager init took {}ms", step_start.elapsed().as_millis());
 
 	let channel_manager = Arc::new(channel_manager);
 
@@ -1682,6 +1720,7 @@ fn build_with_store_internal(
 
 	// Initialize the GossipSource
 	// Use the configured gossip source, if the user set one, otherwise default to P2PNetwork.
+	let step_start = Instant::now();
 	let gossip_source_config = gossip_source_config.unwrap_or(&GossipSourceConfig::P2PNetwork);
 
 	let gossip_source = match gossip_source_config {
@@ -1716,7 +1755,9 @@ fn build_with_store_internal(
 			))
 		},
 	};
+	eprintln!("TIMING: [ldk-node] gossip_source setup took {}ms", step_start.elapsed().as_millis());
 
+	let step_start = Instant::now();
 	let event_queue = match runtime
 		.block_on(async { read_event_queue(Arc::clone(&kv_store), Arc::clone(&logger)).await })
 	{
@@ -1730,7 +1771,9 @@ fn build_with_store_internal(
 			}
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_event_queue() took {}ms", step_start.elapsed().as_millis());
 
+	let step_start = Instant::now();
 	let (liquidity_source, custom_message_handler) =
 		if let Some(lsc) = liquidity_source_config.as_ref() {
 			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
@@ -1790,6 +1833,7 @@ fn build_with_store_internal(
 		} else {
 			(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
 		};
+	eprintln!("TIMING: [ldk-node] liquidity_source setup took {}ms", step_start.elapsed().as_millis());
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
@@ -1830,6 +1874,7 @@ fn build_with_store_internal(
 	));
 
 	liquidity_source.as_ref().map(|l| l.set_peer_manager(Arc::clone(&peer_manager)));
+	eprintln!("TIMING: [ldk-node] peer_manager setup took {}ms", step_start.elapsed().as_millis());
 
 	gossip_source.set_gossip_verifier(
 		Arc::clone(&chain_source),
@@ -1840,6 +1885,7 @@ fn build_with_store_internal(
 	let connection_manager =
 		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
 
+	let step_start = Instant::now();
 	let output_sweeper = match runtime.block_on(async {
 		read_output_sweeper(
 			Arc::clone(&tx_broadcaster),
@@ -1870,7 +1916,9 @@ fn build_with_store_internal(
 			}
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_output_sweeper() took {}ms", step_start.elapsed().as_millis());
 
+	let step_start = Instant::now();
 	let peer_store = match runtime
 		.block_on(async { read_peer_info(Arc::clone(&kv_store), Arc::clone(&logger)).await })
 	{
@@ -1884,6 +1932,7 @@ fn build_with_store_internal(
 			}
 		},
 	};
+	eprintln!("TIMING: [ldk-node] read_peer_info() took {}ms", step_start.elapsed().as_millis());
 
 	let om_mailbox = if let Some(AsyncPaymentsRole::Server) = async_payments_role {
 		Some(Arc::new(OnionMessageMailbox::new()))
@@ -1897,6 +1946,7 @@ fn build_with_store_internal(
 
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
+	eprintln!("TIMING: [ldk-node] build_with_store_internal TOTAL took {}ms", build_start.elapsed().as_millis());
 	Ok(Node {
 		runtime,
 		stop_sender,
