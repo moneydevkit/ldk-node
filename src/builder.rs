@@ -1256,10 +1256,22 @@ fn build_with_store_internal(
 	}
 
 	// Initialize the status fields.
+	// PARALLEL GROUP 1: read_node_metrics + read_payments
 	let step_start = Instant::now();
-	let node_metrics = match runtime
-		.block_on(async { read_node_metrics(Arc::clone(&kv_store), Arc::clone(&logger)).await })
-	{
+	let (node_metrics_result, payments_result) = runtime.block_on(async {
+		let kv_store_1 = Arc::clone(&kv_store);
+		let logger_1 = Arc::clone(&logger);
+		let kv_store_2 = Arc::clone(&kv_store);
+		let logger_2 = Arc::clone(&logger);
+
+		tokio::join!(
+			read_node_metrics(kv_store_1, logger_1),
+			read_payments(kv_store_2, logger_2)
+		)
+	});
+	eprintln!("TIMING: [ldk-node] PARALLEL read_node_metrics + read_payments took {}ms", step_start.elapsed().as_millis());
+
+	let node_metrics = match node_metrics_result {
 		Ok(metrics) => Arc::new(RwLock::new(metrics)),
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
@@ -1270,15 +1282,11 @@ fn build_with_store_internal(
 			}
 		},
 	};
-	eprintln!("TIMING: [ldk-node] read_node_metrics() took {}ms", step_start.elapsed().as_millis());
 
 	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
-	let step_start = Instant::now();
-	let payment_store = match runtime
-		.block_on(async { read_payments(Arc::clone(&kv_store), Arc::clone(&logger)).await })
-	{
+	let payment_store = match payments_result {
 		Ok(payments) => Arc::new(PaymentStore::new(
 			payments,
 			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
@@ -1291,7 +1299,6 @@ fn build_with_store_internal(
 			return Err(BuildError::ReadFailed);
 		},
 	};
-	eprintln!("TIMING: [ldk-node] read_payments() took {}ms", step_start.elapsed().as_millis());
 
 	let step_start = Instant::now();
 	let (chain_source, chain_tip_opt) = match chain_data_source_config {
@@ -1511,11 +1518,22 @@ fn build_with_store_internal(
 		peer_storage_key,
 	));
 
-	// Initialize the network graph, scorer, and router
+	// PARALLEL GROUP 2: read_network_graph + read_event_queue
 	let step_start = Instant::now();
-	let network_graph = match runtime
-		.block_on(async { read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)).await })
-	{
+	let (network_graph_result, event_queue_result) = runtime.block_on(async {
+		let kv_store_1 = Arc::clone(&kv_store);
+		let logger_1 = Arc::clone(&logger);
+		let kv_store_2 = Arc::clone(&kv_store);
+		let logger_2 = Arc::clone(&logger);
+
+		tokio::join!(
+			read_network_graph(kv_store_1, logger_1),
+			read_event_queue(kv_store_2, logger_2)
+		)
+	});
+	eprintln!("TIMING: [ldk-node] PARALLEL read_network_graph + read_event_queue took {}ms", step_start.elapsed().as_millis());
+
+	let network_graph = match network_graph_result {
 		Ok(graph) => Arc::new(graph),
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
@@ -1526,7 +1544,18 @@ fn build_with_store_internal(
 			}
 		},
 	};
-	eprintln!("TIMING: [ldk-node] read_network_graph() took {}ms", step_start.elapsed().as_millis());
+
+	let event_queue = match event_queue_result {
+		Ok(event_queue) => Arc::new(event_queue),
+		Err(e) => {
+			if e.kind() == std::io::ErrorKind::NotFound {
+				Arc::new(EventQueue::new(Arc::clone(&kv_store), Arc::clone(&logger)))
+			} else {
+				log_error!(logger, "Failed to read event queue from store: {}", e);
+				return Err(BuildError::ReadFailed);
+			}
+		},
+	};
 
 	let step_start = Instant::now();
 	let local_scorer = match runtime.block_on(async {
@@ -1757,21 +1786,7 @@ fn build_with_store_internal(
 	};
 	eprintln!("TIMING: [ldk-node] gossip_source setup took {}ms", step_start.elapsed().as_millis());
 
-	let step_start = Instant::now();
-	let event_queue = match runtime
-		.block_on(async { read_event_queue(Arc::clone(&kv_store), Arc::clone(&logger)).await })
-	{
-		Ok(event_queue) => Arc::new(event_queue),
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				Arc::new(EventQueue::new(Arc::clone(&kv_store), Arc::clone(&logger)))
-			} else {
-				log_error!(logger, "Failed to read event queue from store: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
-	};
-	eprintln!("TIMING: [ldk-node] read_event_queue() took {}ms", step_start.elapsed().as_millis());
+	// event_queue was already read in PARALLEL GROUP 2 above
 
 	let step_start = Instant::now();
 	let (liquidity_source, custom_message_handler) =
@@ -1885,18 +1900,33 @@ fn build_with_store_internal(
 	let connection_manager =
 		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
 
+	// PARALLEL GROUP 3: read_output_sweeper + read_peer_info
 	let step_start = Instant::now();
-	let output_sweeper = match runtime.block_on(async {
-		read_output_sweeper(
-			Arc::clone(&tx_broadcaster),
-			Arc::clone(&fee_estimator),
-			Arc::clone(&chain_source),
-			Arc::clone(&keys_manager),
-			Arc::clone(&kv_store),
-			Arc::clone(&logger),
+	let (output_sweeper_result, peer_store_result) = runtime.block_on(async {
+		let tx_broadcaster_clone = Arc::clone(&tx_broadcaster);
+		let fee_estimator_clone = Arc::clone(&fee_estimator);
+		let chain_source_clone = Arc::clone(&chain_source);
+		let keys_manager_clone = Arc::clone(&keys_manager);
+		let kv_store_1 = Arc::clone(&kv_store);
+		let logger_1 = Arc::clone(&logger);
+		let kv_store_2 = Arc::clone(&kv_store);
+		let logger_2 = Arc::clone(&logger);
+
+		tokio::join!(
+			read_output_sweeper(
+				tx_broadcaster_clone,
+				fee_estimator_clone,
+				chain_source_clone,
+				keys_manager_clone,
+				kv_store_1,
+				logger_1,
+			),
+			read_peer_info(kv_store_2, logger_2)
 		)
-		.await
-	}) {
+	});
+	eprintln!("TIMING: [ldk-node] PARALLEL read_output_sweeper + read_peer_info took {}ms", step_start.elapsed().as_millis());
+
+	let output_sweeper = match output_sweeper_result {
 		Ok(output_sweeper) => Arc::new(output_sweeper),
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
@@ -1916,12 +1946,8 @@ fn build_with_store_internal(
 			}
 		},
 	};
-	eprintln!("TIMING: [ldk-node] read_output_sweeper() took {}ms", step_start.elapsed().as_millis());
 
-	let step_start = Instant::now();
-	let peer_store = match runtime
-		.block_on(async { read_peer_info(Arc::clone(&kv_store), Arc::clone(&logger)).await })
-	{
+	let peer_store = match peer_store_result {
 		Ok(peer_store) => Arc::new(peer_store),
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
@@ -1932,7 +1958,6 @@ fn build_with_store_internal(
 			}
 		},
 	};
-	eprintln!("TIMING: [ldk-node] read_peer_info() took {}ms", step_start.elapsed().as_millis());
 
 	let om_mailbox = if let Some(AsyncPaymentsRole::Server) = async_payments_role {
 		Some(Arc::new(OnionMessageMailbox::new()))
