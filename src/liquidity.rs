@@ -1202,10 +1202,10 @@ where
 					},
 				}
 			},
-			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::SendWebhook { counterparty_node_id }) => {
+			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::SendWebhook { counterparty_node_id, payment_hash }) => {
 				if let Err(e) = self
 					.event_queue
-					.add_event(crate::event::Event::SendWebhook { node_id: counterparty_node_id }).await
+					.add_event(crate::event::Event::SendWebhook { node_id: counterparty_node_id, payment_hash }).await
 				{
 					log_error!(self.logger, "Failed to queue webhook event: {:?}", e);
 				}

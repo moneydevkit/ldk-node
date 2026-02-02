@@ -238,6 +238,8 @@ pub enum Event {
 	SendWebhook {
 		/// The node id of the node that needs to be notified.
 		node_id: PublicKey,
+		/// The payment hash
+		payment_hash: PaymentHash
 	},
 	/// A channel splice is pending confirmation on-chain.
 	SplicePending {
@@ -321,6 +323,7 @@ impl_writeable_tlv_based_enum!(Event,
 	},
 	(8, SendWebhook) => {
 		(0, node_id, required),
+		(1, payment_hash, required),
 	},
 	(9, SplicePending) => {
 		(1, channel_id, required),
