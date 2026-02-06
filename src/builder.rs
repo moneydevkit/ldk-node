@@ -71,6 +71,7 @@ use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
+use crate::router::{LSPS4BlindedPathConfig, LSPS4Router};
 use crate::runtime::Runtime;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
@@ -1594,12 +1595,22 @@ fn build_with_store_internal(
 	}
 
 	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
-	let router = Arc::new(DefaultRouter::new(
+	let inner_router = DefaultRouter::new(
 		Arc::clone(&network_graph),
 		Arc::clone(&logger),
 		Arc::clone(&keys_manager),
 		Arc::clone(&scorer),
 		scoring_fee_params,
+	);
+
+	// Create shared LSPS4 config state for the router
+	let lsps4_blinded_path_config: Arc<RwLock<Option<LSPS4BlindedPathConfig>>> =
+		Arc::new(RwLock::new(None));
+
+	let router = Arc::new(LSPS4Router::new(
+		inner_router,
+		Arc::clone(&lsps4_blinded_path_config),
+		Arc::clone(&keys_manager),
 	));
 
 	let mut user_config = default_user_config(&config);
@@ -1801,6 +1812,7 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&event_queue),
+				Arc::clone(&lsps4_blinded_path_config),
 			);
 
 			lsc.lsps1_client.as_ref().map(|config| {

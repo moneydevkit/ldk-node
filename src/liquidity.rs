@@ -46,6 +46,7 @@ use tokio::sync::oneshot;
 use crate::builder::BuildError;
 use crate::chain::ChainSource;
 use crate::connection::ConnectionManager;
+use crate::router::LSPS4BlindedPathConfig;
 use crate::event::EventQueue;
 use crate::logger::{log_debug, log_error, log_info, Logger};
 use crate::runtime::Runtime;
@@ -199,6 +200,7 @@ where
 	lsps2_service: Option<LSPS2Service>,
 	lsps4_client: Option<LSPS4Client>,
 	lsps4_service: Option<LSPS4Service>,
+	lsps4_blinded_path_config: Arc<RwLock<Option<LSPS4BlindedPathConfig>>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
@@ -218,6 +220,7 @@ where
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>,
 		config: Arc<Config>, logger: L, event_queue: Arc<EventQueue<L>>,
+		lsps4_blinded_path_config: Arc<RwLock<Option<LSPS4BlindedPathConfig>>>,
 	) -> Self {
 		let lsps1_client = None;
 		let lsps2_client = None;
@@ -230,6 +233,7 @@ where
 			lsps2_service,
 			lsps4_client,
 			lsps4_service,
+			lsps4_blinded_path_config,
 			wallet,
 			channel_manager,
 			keys_manager,
@@ -358,6 +362,7 @@ where
 			lsps2_service: self.lsps2_service,
 			lsps4_client: self.lsps4_client,
 			lsps4_service: self.lsps4_service,
+			lsps4_blinded_path_config: self.lsps4_blinded_path_config,
 			wallet: self.wallet,
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
@@ -379,6 +384,7 @@ where
 	lsps2_service: Option<LSPS2Service>,
 	lsps4_client: Option<LSPS4Client>,
 	lsps4_service: Option<LSPS4Service>,
+	lsps4_blinded_path_config: Arc<RwLock<Option<LSPS4BlindedPathConfig>>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
@@ -395,6 +401,33 @@ where
 {
 	pub(crate) fn set_peer_manager(&self, peer_manager: Arc<PeerManager>) {
 		*self.peer_manager.write().unwrap() = Some(peer_manager);
+	}
+
+	/// Updates the LSPS4 blinded path config used by the router for BOLT12 offers.
+	///
+	/// This is called after successful LSPS4 registration to enable BOLT12 offers
+	/// to create blinded payment paths through the LSP.
+	pub(crate) fn set_lsps4_blinded_path_config(
+		&self, lsp_node_id: PublicKey, intercept_scid: u64, cltv_expiry_delta: u32,
+	) {
+		let config = LSPS4BlindedPathConfig { lsp_node_id, intercept_scid, cltv_expiry_delta };
+		*self.lsps4_blinded_path_config.write().unwrap() = Some(config);
+		log_info!(
+			self.logger,
+			"LSPS4 blinded path config set: lsp_node_id={}, intercept_scid={}, cltv_expiry_delta={}",
+			lsp_node_id,
+			intercept_scid,
+			cltv_expiry_delta
+		);
+	}
+
+	/// Clears the LSPS4 blinded path config.
+	///
+	/// Call this after a JIT channel has been opened so that subsequent BOLT12 offers
+	/// use normal blinded paths through the existing channel instead of LSPS4.
+	pub(crate) fn clear_lsps4_blinded_path_config(&self) {
+		*self.lsps4_blinded_path_config.write().unwrap() = None;
+		log_info!(self.logger, "LSPS4 blinded path config cleared");
 	}
 
 	pub(crate) fn liquidity_manager(&self) -> Arc<LiquidityManager<L>> {
@@ -1656,7 +1689,7 @@ where
 		}
 		log_info!(self.logger, "TIMING: lsps4_register_node() sent request, waiting for response...");
 
-		let result = tokio::time::timeout(
+		let response = tokio::time::timeout(
 			Duration::from_secs(LIQUIDITY_REQUEST_TIMEOUT_SECS),
 			register_node_receiver,
 		)
@@ -1668,10 +1701,26 @@ where
 		.map_err(|e| {
 			log_error!(self.logger, "Failed to handle response from liquidity service: {}", e);
 			Error::LiquidityRequestFailed
-		});
+		})?;
+
+		// Update the LSPS4 blinded path config for BOLT12 offers
+		self.set_lsps4_blinded_path_config(
+			lsps4_client.lsp_node_id,
+			response.intercept_scid,
+			response.cltv_expiry_delta,
+		);
 
 		log_info!(self.logger, "TIMING: lsps4_register_node() TOTAL took {}ms", fn_start.elapsed().as_millis());
-		result
+		Ok(response)
+	}
+
+	/// Registers with LSPS4 for BOLT12 offer creation.
+	///
+	/// This populates the LSPS4 blinded path config used by the router when creating
+	/// blinded payment paths for BOLT12 offers.
+	pub(crate) async fn lsps4_register_for_bolt12(&self) -> Result<(), Error> {
+		self.lsps4_register_node().await?;
+		Ok(())
 	}
 
 	pub(crate) async fn lsps4_receive_to_jit_channel(

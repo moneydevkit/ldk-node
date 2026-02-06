@@ -96,6 +96,7 @@ pub mod logger;
 mod message_handler;
 pub mod payment;
 mod peer_store;
+mod router;
 mod runtime;
 mod scoring;
 mod tx_broadcaster;
@@ -880,8 +881,12 @@ impl Node {
 	#[cfg(not(feature = "uniffi"))]
 	pub fn bolt12_payment(&self) -> Bolt12Payment {
 		Bolt12Payment::new(
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.connection_manager),
+			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
+			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
@@ -895,8 +900,12 @@ impl Node {
 	#[cfg(feature = "uniffi")]
 	pub fn bolt12_payment(&self) -> Arc<Bolt12Payment> {
 		Arc::new(Bolt12Payment::new(
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.connection_manager),
+			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
+			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
