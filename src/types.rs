@@ -31,6 +31,7 @@ use lightning_net_tokio::SocketDescriptor;
 use crate::chain::ChainSource;
 use crate::config::ChannelConfig;
 use crate::data_store::DataStore;
+use crate::router::LSPS4Router;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::RuntimeSpawner;
 use crate::logger::Logger;
@@ -137,14 +138,7 @@ pub(crate) type Broadcaster = crate::tx_broadcaster::TransactionBroadcaster<Arc<
 pub(crate) type Wallet = crate::wallet::Wallet;
 pub(crate) type KeysManager = crate::wallet::WalletKeysManager;
 
-pub(crate) type Router = DefaultRouter<
-	Arc<Graph>,
-	Arc<Logger>,
-	Arc<KeysManager>,
-	Arc<Mutex<Scorer>>,
-	ProbabilisticScoringFeeParameters,
-	Scorer,
->;
+pub(crate) type Router = LSPS4Router;
 pub(crate) type Scorer = CombinedScorer<Arc<Graph>, Arc<Logger>>;
 
 pub(crate) type Graph = gossip::NetworkGraph<Arc<Logger>>;
@@ -176,7 +170,7 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	IgnoringMessageHandler,
 >;
 
-pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
+pub(crate) type MessageRouter = lightning::onion_message::messenger::NodeIdMessageRouter<
 	Arc<Graph>,
 	Arc<Logger>,
 	Arc<KeysManager>,

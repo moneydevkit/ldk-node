@@ -2208,6 +2208,224 @@ async fn lsps4_channel_size_tiers_are_applied() {
 	assert_eq!(expected_channel_values, vec![100_000, 500_000, 1_000_000, 1_000_000, 1_000_000]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps4_bolt12_jit_channel() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+
+	let sync_config = EsploraSyncConfig { background_sync_config: None };
+
+	// Setup three nodes: service, client, and payer.
+	let forwarding_fee_ppm = 20_000u64;
+	let channel_over_provisioning_ppm = 100_000u32;
+	let min_channel_size_msat = 10_000_000u64;
+	let lsps4_service_config = LSPS4ServiceConfig {
+		min_channel_size_msat,
+		channel_over_provisioning_ppm,
+		forwarding_fee_proportional_millionths: forwarding_fee_ppm,
+		channel_size_tiers: vec![],
+	};
+
+	let service_config = random_config(true);
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.set_liquidity_provider_lsps4(lsps4_service_config);
+	let service_node = service_builder.build().unwrap();
+	service_node.start().unwrap();
+
+	let service_node_id = service_node.node_id();
+	let service_listen_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config(true);
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr);
+	let client_node = client_builder.build().unwrap();
+	client_node.start().unwrap();
+
+	let payer_config = random_config(true);
+	setup_builder!(payer_builder, payer_config.node_config);
+	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	let payer_node = payer_builder.build().unwrap();
+	payer_node.start().unwrap();
+
+	let service_onchain_addr = service_node.onchain_payment().new_address().unwrap();
+	let client_onchain_addr = client_node.onchain_payment().new_address().unwrap();
+	let payer_onchain_addr = payer_node.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 10_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![service_onchain_addr, client_onchain_addr, payer_onchain_addr],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+
+	// Open a channel payer -> service so the payer can reach the client through the LSP.
+	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	service_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+	expect_channel_ready_event!(payer_node, service_node.node_id());
+	expect_channel_ready_event!(service_node, payer_node.node_id());
+
+	let jit_amount_msat = 100_000_000;
+
+	// Client creates a BOLT12 offer with LSPS4 JIT channel support.
+	// This should create blinded payment paths through the LSP even though
+	// the client has no channels.
+	let offer = client_node
+		.bolt12_payment()
+		.receive_via_lsps4_jit_channel(jit_amount_msat, "lsps4 bolt12 test", None, None)
+		.unwrap();
+
+	// Have the payer pay the offer, triggering a JIT channel from service -> client.
+	let payment_id = payer_node.bolt12_payment().send(&offer, None, None, None).unwrap();
+
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+
+	let skimmed_fee_msat = (jit_amount_msat * forwarding_fee_ppm) / 1_000_000;
+	let expected_received_amount_msat = jit_amount_msat - skimmed_fee_msat;
+	eprintln!(
+		"[lsps4-bolt12-test] expected skimmed fee: {} msat, expected client amount: {} msat",
+		skimmed_fee_msat, expected_received_amount_msat
+	);
+
+	let mut saw_forwarded_event = false;
+	for _ in 0..2 {
+		match service_node.wait_next_event() {
+			Event::PaymentForwarded {
+				skimmed_fee_msat: event_skimmed_fee_msat,
+				outbound_amount_forwarded_msat,
+				..
+			} => {
+				assert_eq!(event_skimmed_fee_msat, Some(skimmed_fee_msat));
+				assert_eq!(outbound_amount_forwarded_msat, Some(expected_received_amount_msat));
+				eprintln!(
+					"[lsps4-bolt12-test] service forwarded payment; skimmed {} msat, forwarded {} msat",
+					event_skimmed_fee_msat.unwrap(),
+					outbound_amount_forwarded_msat.unwrap()
+				);
+				saw_forwarded_event = true;
+				service_node.event_handled().unwrap();
+				break;
+			},
+			Event::SendWebhook { .. } => {
+				eprintln!("[lsps4-bolt12-test] service received webhook notification request");
+				service_node.event_handled().unwrap();
+			},
+			other => {
+				panic!("Unexpected event on service node: {:?}", other);
+			},
+		}
+	}
+	assert!(saw_forwarded_event, "Service node never forwarded the payment");
+
+	expect_payment_successful_event!(payer_node, Some(payment_id), None);
+	expect_payment_received_event!(client_node, expected_received_amount_msat);
+
+	// Verify the client received the payment.
+	let client_payments =
+		client_node.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt12Offer { .. }));
+	assert_eq!(client_payments.len(), 1);
+	assert_eq!(client_payments[0].amount_msat, Some(expected_received_amount_msat));
+	assert_eq!(client_payments[0].direction, PaymentDirection::Inbound);
+	assert_eq!(client_payments[0].status, PaymentStatus::Succeeded);
+
+	// Verify a channel was opened.
+	let client_channels = client_node.list_channels();
+	assert_eq!(client_channels.len(), 1);
+	assert_eq!(client_channels[0].counterparty_node_id, service_node_id);
+
+	// =========================================================================
+	// SECOND PAYMENT: Should use the existing channel, NOT open a new one
+	// =========================================================================
+	eprintln!("[lsps4-bolt12-test] === Starting second payment (should use existing channel) ===");
+
+	// Verify the channel is ready (no need to wait for blocks - zero-conf should work)
+	assert_eq!(client_node.list_channels().len(), 1, "Client should have 1 channel after first payment");
+
+	// Second payment amount must fit within the remaining channel capacity.
+	// First payment was 100M, channel over-provisioned by 10% = 110M total.
+	// After forwarding 100M, ~10M outbound capacity remains on the LSP side.
+	// Use 5M to fit comfortably within that.
+	let second_amount_msat = 5_000_000;
+
+	// Client creates another BOLT12 offer via LSPS4 (same as first payment).
+	// The offer will have LSPS4 blinded paths through the intercept_scid.
+	// When the payment arrives at the LSP, it should forward through the
+	// EXISTING channel instead of opening a new one.
+	let second_offer = client_node
+		.bolt12_payment()
+		.receive_via_lsps4_jit_channel(second_amount_msat, "second bolt12 payment", None, None)
+		.unwrap();
+
+	// Payer pays the second offer
+	let second_payment_id = payer_node.bolt12_payment().send(&second_offer, None, None, None).unwrap();
+
+	// Like BOLT11 LSPS4, payments always route through the LSPS4 intercept_scid.
+	// The LSP decides whether to use an existing channel or open a new one.
+	// Since the channel from the first payment has capacity, the LSP should
+	// forward through it (with skimmed fee) without opening a new channel.
+	let second_skimmed_fee_msat = (second_amount_msat * forwarding_fee_ppm) / 1_000_000;
+	let second_expected_received = second_amount_msat - second_skimmed_fee_msat;
+
+	let mut saw_second_forward = false;
+	for _ in 0..2 {
+		match service_node.wait_next_event() {
+			Event::PaymentForwarded {
+				skimmed_fee_msat: event_skimmed_fee_msat,
+				outbound_amount_forwarded_msat,
+				..
+			} => {
+				// LSPS4 forward through existing channel - with skimmed fee
+				assert_eq!(event_skimmed_fee_msat, Some(second_skimmed_fee_msat));
+				assert_eq!(outbound_amount_forwarded_msat, Some(second_expected_received));
+				eprintln!(
+					"[lsps4-bolt12-test] service forwarded second payment; skimmed {} msat, forwarded {} msat",
+					event_skimmed_fee_msat.unwrap(),
+					outbound_amount_forwarded_msat.unwrap()
+				);
+				saw_second_forward = true;
+				service_node.event_handled().unwrap();
+				break;
+			},
+			Event::SendWebhook { .. } => {
+				eprintln!("[lsps4-bolt12-test] service received webhook notification request");
+				service_node.event_handled().unwrap();
+			},
+			other => {
+				panic!("Unexpected event on service node for second payment: {:?}", other);
+			},
+		}
+	}
+	assert!(saw_second_forward, "Service node never forwarded the second payment");
+
+	expect_payment_successful_event!(payer_node, Some(second_payment_id), None);
+	expect_payment_received_event!(client_node, second_expected_received);
+
+	// Verify still only 1 channel (no new channel was opened)
+	let client_channels_after = client_node.list_channels();
+	assert_eq!(client_channels_after.len(), 1, "Second payment should NOT have opened a new channel");
+	assert_eq!(client_channels_after[0].counterparty_node_id, service_node_id);
+
+	// Verify both payments were received
+	let all_client_payments =
+		client_node.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt12Offer { .. }));
+	assert_eq!(all_client_payments.len(), 2);
+	eprintln!("[lsps4-bolt12-test] === Both payments succeeded, still only 1 channel ===");
+}
+
 #[test]
 fn facade_logging() {
 	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();

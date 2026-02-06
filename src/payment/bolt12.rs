@@ -24,10 +24,14 @@ use lightning_types::string::UntrustedString;
 use rand::RngCore;
 
 use crate::config::{AsyncPaymentsRole, Config, LDK_PAYMENT_RETRY_TIMEOUT};
+use crate::connection::ConnectionManager;
 use crate::error::Error;
 use crate::ffi::{maybe_deref, maybe_wrap};
+use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use crate::peer_store::{PeerInfo, PeerStore};
+use crate::runtime::Runtime;
 use crate::types::{ChannelManager, PaymentStore};
 
 #[cfg(not(feature = "uniffi"))]
@@ -52,8 +56,12 @@ type Refund = Arc<crate::ffi::Refund>;
 /// [BOLT 12]: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
 /// [`Node::bolt12_payment`]: crate::Node::bolt12_payment
 pub struct Bolt12Payment {
+	runtime: Arc<Runtime>,
 	channel_manager: Arc<ChannelManager>,
+	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
+	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
+	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
 	logger: Arc<Logger>,
@@ -62,11 +70,25 @@ pub struct Bolt12Payment {
 
 impl Bolt12Payment {
 	pub(crate) fn new(
-		channel_manager: Arc<ChannelManager>, payment_store: Arc<PaymentStore>,
+		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
+		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
+		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
 		config: Arc<Config>, is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
 		async_payments_role: Option<AsyncPaymentsRole>,
 	) -> Self {
-		Self { channel_manager, payment_store, config, is_running, logger, async_payments_role }
+		Self {
+			runtime,
+			channel_manager,
+			connection_manager,
+			liquidity_source,
+			payment_store,
+			peer_store,
+			config,
+			is_running,
+			logger,
+			async_payments_role,
+		}
 	}
 
 	/// Send a payment given an offer.
@@ -366,6 +388,93 @@ impl Bolt12Payment {
 		})?;
 
 		Ok(maybe_wrap(offer))
+	}
+
+	/// Returns a payable offer that can be used to request and receive a payment of the amount
+	/// given via a newly created just-in-time (JIT) channel.
+	///
+	/// When the returned offer is paid, the configured LSPS4-compliant LSP will open a channel
+	/// to us, supplying just-in-time inbound liquidity.
+	///
+	/// This is useful for nodes that have no channels but want to receive BOLT12 payments.
+	/// The offer will contain blinded payment paths that route through the LSP.
+	pub fn receive_via_lsps4_jit_channel(
+		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>,
+		quantity: Option<u64>,
+	) -> Result<Offer, Error> {
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let (node_id, address) =
+			liquidity_source.get_lsps4_lsp_details().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let peer_info = PeerInfo { node_id, address };
+
+		let con_node_id = peer_info.node_id;
+		let con_addr = peer_info.address.clone();
+		let con_cm = Arc::clone(&self.connection_manager);
+
+		// Connect to LSP
+		self.runtime.block_on(async move {
+			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
+		})?;
+
+		log_info!(self.logger, "Connected to LSP {}@{}. ", peer_info.node_id, peer_info.address);
+
+		// Register with LSPS4 to populate the blinded path config
+		let liquidity_source = Arc::clone(&liquidity_source);
+		self.runtime.block_on(async move { liquidity_source.lsps4_register_for_bolt12().await })?;
+
+		// Now create the offer - the LSPS4Router will use the config to create blinded payment paths
+		let offer = self.receive_inner(amount_msat, description, expiry_secs, quantity)?;
+
+		// Persist LSP peer to make sure we reconnect on restart.
+		self.peer_store.add_peer(peer_info)?;
+
+		Ok(maybe_wrap(offer))
+	}
+
+	/// Returns a payable offer that can be used to request and receive a payment for which the
+	/// amount is to be determined by the user via a newly created just-in-time (JIT) channel.
+	///
+	/// When the returned offer is paid, the configured LSPS4-compliant LSP will open a channel
+	/// to us, supplying just-in-time inbound liquidity.
+	///
+	/// This is useful for nodes that have no channels but want to receive BOLT12 payments.
+	/// The offer will contain blinded payment paths that route through the LSP.
+	pub fn receive_variable_amount_via_lsps4_jit_channel(
+		&self, description: &str, expiry_secs: Option<u32>,
+	) -> Result<Offer, Error> {
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let (node_id, address) =
+			liquidity_source.get_lsps4_lsp_details().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let peer_info = PeerInfo { node_id, address };
+
+		let con_node_id = peer_info.node_id;
+		let con_addr = peer_info.address.clone();
+		let con_cm = Arc::clone(&self.connection_manager);
+
+		// Connect to LSP
+		self.runtime.block_on(async move {
+			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
+		})?;
+
+		log_info!(self.logger, "Connected to LSP {}@{}. ", peer_info.node_id, peer_info.address);
+
+		// Register with LSPS4 to populate the blinded path config
+		let liquidity_source = Arc::clone(&liquidity_source);
+		self.runtime.block_on(async move { liquidity_source.lsps4_register_for_bolt12().await })?;
+
+		// Now create the offer - the LSPS4Router will use the config to create blinded payment paths
+		let offer = self.receive_variable_amount(description, expiry_secs)?;
+
+		// Persist LSP peer to make sure we reconnect on restart.
+		self.peer_store.add_peer(peer_info)?;
+
+		Ok(offer)
 	}
 
 	/// Requests a refund payment for the given [`Refund`].
