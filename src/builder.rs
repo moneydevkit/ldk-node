@@ -1255,21 +1255,40 @@ fn build_with_store_internal(
 		}
 	}
 
-	// Initialize the status fields.
-	// PARALLEL GROUP 1: read_node_metrics + read_payments
-	let step_start = Instant::now();
-	let (node_metrics_result, payments_result) = runtime.block_on(async {
-		let kv_store_1 = Arc::clone(&kv_store);
-		let logger_1 = Arc::clone(&logger);
-		let kv_store_2 = Arc::clone(&kv_store);
-		let logger_2 = Arc::clone(&logger);
+	// PHASE 1: Spawn independent reads (network_graph, event_queue, peer_info) on worker
+	// threads AND run required reads (metrics, payments) concurrently. The spawned reads
+	// continue running in the background during the sync wallet chain below.
+	let step_start_phase1 = Instant::now();
+	let (node_metrics_result, payments_result, independent_reads_handle) = runtime.block_on(async {
+		// Spawn independent reads on worker threads — they have NO dependency on wallet/chain_source
+		// and will keep running after this block_on returns.
+		let kv_store_ng = Arc::clone(&kv_store);
+		let logger_ng = Arc::clone(&logger);
+		let kv_store_eq = Arc::clone(&kv_store);
+		let logger_eq = Arc::clone(&logger);
+		let kv_store_pi = Arc::clone(&kv_store);
+		let logger_pi = Arc::clone(&logger);
+		let independent_handle = tokio::spawn(async move {
+			tokio::join!(
+				read_network_graph(kv_store_ng, logger_ng),
+				read_event_queue(kv_store_eq, logger_eq),
+				read_peer_info(kv_store_pi, logger_pi),
+			)
+		});
 
-		tokio::join!(
-			read_node_metrics(kv_store_1, logger_1),
-			read_payments(kv_store_2, logger_2)
-		)
+		// Run metrics + payments on current thread (wallet chain depends on these)
+		let kv_store_nm = Arc::clone(&kv_store);
+		let logger_nm = Arc::clone(&logger);
+		let kv_store_py = Arc::clone(&kv_store);
+		let logger_py = Arc::clone(&logger);
+		let (nm, py) = tokio::join!(
+			read_node_metrics(kv_store_nm, logger_nm),
+			read_payments(kv_store_py, logger_py),
+		);
+
+		(nm, py, independent_handle)
 	});
-	eprintln!("TIMING: [ldk-node] PARALLEL read_node_metrics + read_payments took {}ms", step_start.elapsed().as_millis());
+	eprintln!("TIMING: [ldk-node] PHASE 1 (metrics + payments, spawned ng+eq+pi) took {}ms", step_start_phase1.elapsed().as_millis());
 
 	let node_metrics = match node_metrics_result {
 		Ok(metrics) => Arc::new(RwLock::new(metrics)),
@@ -1518,20 +1537,13 @@ fn build_with_store_internal(
 		peer_storage_key,
 	));
 
-	// PARALLEL GROUP 2: read_network_graph + read_event_queue
-	let step_start = Instant::now();
-	let (network_graph_result, event_queue_result) = runtime.block_on(async {
-		let kv_store_1 = Arc::clone(&kv_store);
-		let logger_1 = Arc::clone(&logger);
-		let kv_store_2 = Arc::clone(&kv_store);
-		let logger_2 = Arc::clone(&logger);
-
-		tokio::join!(
-			read_network_graph(kv_store_1, logger_1),
-			read_event_queue(kv_store_2, logger_2)
-		)
+	// PHASE 2: Await independent reads that were spawned in PHASE 1.
+	// These ran on worker threads during the sync wallet→keys→monitors chain above.
+	let step_start_phase2 = Instant::now();
+	let (network_graph_result, event_queue_result, peer_store_result) = runtime.block_on(async {
+		independent_reads_handle.await.expect("independent reads task panicked")
 	});
-	eprintln!("TIMING: [ldk-node] PARALLEL read_network_graph + read_event_queue took {}ms", step_start.elapsed().as_millis());
+	eprintln!("TIMING: [ldk-node] PHASE 2 await independent reads took {}ms (ran in parallel with wallet chain)", step_start_phase2.elapsed().as_millis());
 
 	let network_graph = match network_graph_result {
 		Ok(graph) => Arc::new(graph),
@@ -1900,31 +1912,19 @@ fn build_with_store_internal(
 	let connection_manager =
 		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
 
-	// PARALLEL GROUP 3: read_output_sweeper + read_peer_info
+	// read_output_sweeper (peer_info was already read in the spawned group above)
 	let step_start = Instant::now();
-	let (output_sweeper_result, peer_store_result) = runtime.block_on(async {
-		let tx_broadcaster_clone = Arc::clone(&tx_broadcaster);
-		let fee_estimator_clone = Arc::clone(&fee_estimator);
-		let chain_source_clone = Arc::clone(&chain_source);
-		let keys_manager_clone = Arc::clone(&keys_manager);
-		let kv_store_1 = Arc::clone(&kv_store);
-		let logger_1 = Arc::clone(&logger);
-		let kv_store_2 = Arc::clone(&kv_store);
-		let logger_2 = Arc::clone(&logger);
-
-		tokio::join!(
-			read_output_sweeper(
-				tx_broadcaster_clone,
-				fee_estimator_clone,
-				chain_source_clone,
-				keys_manager_clone,
-				kv_store_1,
-				logger_1,
-			),
-			read_peer_info(kv_store_2, logger_2)
-		)
+	let output_sweeper_result = runtime.block_on(async {
+		read_output_sweeper(
+			Arc::clone(&tx_broadcaster),
+			Arc::clone(&fee_estimator),
+			Arc::clone(&chain_source),
+			Arc::clone(&keys_manager),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		).await
 	});
-	eprintln!("TIMING: [ldk-node] PARALLEL read_output_sweeper + read_peer_info took {}ms", step_start.elapsed().as_millis());
+	eprintln!("TIMING: [ldk-node] read_output_sweeper took {}ms", step_start.elapsed().as_millis());
 
 	let output_sweeper = match output_sweeper_result {
 		Ok(output_sweeper) => Arc::new(output_sweeper),
