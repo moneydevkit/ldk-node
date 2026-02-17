@@ -363,6 +363,34 @@ impl EsploraChainSource {
 		Ok(())
 	}
 
+	pub(super) async fn fetch_chain_tip(
+		&self,
+	) -> Result<(bitcoin::block::Header, u32), Error> {
+		let tip_hash = self.esplora_client.get_tip_hash().await.map_err(|e| {
+			log_error!(self.logger, "Failed to get chain tip hash: {}", e);
+			Error::TxSyncFailed
+		})?;
+
+		let header =
+			self.esplora_client.get_header_by_hash(&tip_hash).await.map_err(|e| {
+				log_error!(self.logger, "Failed to get block header: {}", e);
+				Error::TxSyncFailed
+			})?;
+
+		let status =
+			self.esplora_client.get_block_status(&tip_hash).await.map_err(|e| {
+				log_error!(self.logger, "Failed to get block status: {}", e);
+				Error::TxSyncFailed
+			})?;
+
+		let height = status.height.ok_or_else(|| {
+			log_error!(self.logger, "Block not in best chain");
+			Error::TxSyncFailed
+		})?;
+
+		Ok((header, height))
+	}
+
 	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
 		for tx in &package {
 			let txid = tx.compute_txid();

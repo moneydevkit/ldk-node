@@ -133,7 +133,7 @@ use gossip::GossipSource;
 use graph::NetworkGraph;
 pub use io::utils::generate_entropy_mnemonic;
 use io::utils::write_node_metrics;
-use lightning::chain::BestBlock;
+use lightning::chain::{BestBlock, Confirm};
 use lightning::events::bump_transaction::{Input, Wallet as LdkWallet};
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::chan_utils::{make_funding_redeemscript, FUNDING_TRANSACTION_WITNESS_WEIGHT};
@@ -1501,6 +1501,20 @@ impl Node {
 			let _ = sync_sweeper.regenerate_and_broadcast_spend_if_necessary().await;
 			log_info!(logger, "TIMING: sync_wallets regenerate_and_broadcast_spend_if_necessary() took {}ms", step_start.elapsed().as_millis());
 			log_info!(logger, "TIMING: sync_wallets() TOTAL took {}ms", fn_start.elapsed().as_millis());
+			Ok(())
+		})
+	}
+
+	/// Fetch the latest block header and update the ChannelManager's `highest_seen_timestamp`.
+	pub fn update_chain_tip(&self) -> Result<(), Error> {
+		let chain_source = Arc::clone(&self.chain_source);
+		let channel_manager = Arc::clone(&self.channel_manager);
+		let logger = Arc::clone(&self.logger);
+
+		self.runtime.block_on(async move {
+			let (header, height) = chain_source.fetch_chain_tip().await?;
+			channel_manager.best_block_updated(&header, height);
+			log_info!(logger, "Chain tip updated to height {}", height);
 			Ok(())
 		})
 	}

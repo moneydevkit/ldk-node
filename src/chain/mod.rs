@@ -431,6 +431,17 @@ impl ChainSource {
 		}
 	}
 
+	pub(crate) async fn fetch_chain_tip(
+		&self,
+	) -> Result<(bitcoin::block::Header, u32), Error> {
+		match &self.kind {
+			ChainSourceKind::Esplora(esplora_chain_source) => {
+				esplora_chain_source.fetch_chain_tip().await
+			},
+			_ => Err(Error::TxSyncFailed),
+		}
+	}
+
 	pub(crate) async fn continuously_process_broadcast_queue(
 		&self, mut stop_tx_bcast_receiver: tokio::sync::watch::Receiver<()>,
 	) {

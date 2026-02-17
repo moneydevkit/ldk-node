@@ -45,7 +45,7 @@ use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::{
 	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
 };
-use crate::logger::{log_error, LdkLogger, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::peer_store::PeerStore;
 use crate::types::{Broadcaster, DynStore, KeysManager, Sweeper, WordCount};
 use crate::wallet::ser::{ChangeSetDeserWrapper, ChangeSetSerWrapper};
@@ -161,21 +161,24 @@ pub(crate) async fn read_scorer<G: Deref<Target = NetworkGraph<L>>, L: Deref + C
 where
 	L::Target: LdkLogger,
 {
+	log_info!(logger, "[SCORER-LDK] read_scorer() - Attempting to read scorer from VSS store");
 	let params = ProbabilisticScoringDecayParameters::default();
-	let mut reader = Cursor::new(
-		KVStore::read(
-			&*kv_store,
-			SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
-			SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
-			SCORER_PERSISTENCE_KEY,
-		)
-		.await?,
-	);
+	let data = KVStore::read(
+		&*kv_store,
+		SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+		SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+		SCORER_PERSISTENCE_KEY,
+	)
+	.await?;
+	log_info!(logger, "[SCORER-LDK] read_scorer() - Read {} bytes from VSS store", data.len());
+	let mut reader = Cursor::new(data);
 	let args = (params, network_graph, logger.clone());
-	ProbabilisticScorer::read(&mut reader, args).map_err(|e| {
-		log_error!(logger, "Failed to deserialize scorer: {}", e);
+	let scorer = ProbabilisticScorer::read(&mut reader, args).map_err(|e| {
+		log_error!(logger, "[SCORER-LDK] read_scorer() - Failed to deserialize scorer: {}", e);
 		std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize Scorer")
-	})
+	})?;
+	log_info!(logger, "[SCORER-LDK] read_scorer() - Successfully deserialized scorer from VSS");
+	Ok(scorer)
 }
 
 /// Read previously persisted external pathfinding scores from the cache.
