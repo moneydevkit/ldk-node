@@ -656,6 +656,15 @@ impl Node {
 		Ok(())
 	}
 
+	/// Disconnect all connected peers, closing their TCP connections.
+	///
+	/// This can be called regardless of whether the node is running. Use this to ensure
+	/// TCP connections are torn down on serverless platforms where the node may have connected
+	/// to peers (e.g., during invoice generation) without a full `start()`/`stop()` cycle.
+	pub fn disconnect_all_peers(&self) {
+		self.peer_manager.disconnect_all_peers();
+	}
+
 	/// Disconnects all peers, stops all running background tasks, and shuts down [`Node`].
 	///
 	/// After this returns most API methods will return [`Error::NotRunning`].
