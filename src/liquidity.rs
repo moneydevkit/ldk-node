@@ -208,6 +208,8 @@ where
 	config: Arc<Config>,
 	logger: L,
 	event_queue: Arc<EventQueue<L>>,
+	webhook_client: Option<reqwest::Client>,
+	webhook_url: Option<String>,
 }
 
 impl<L: Deref + Clone> LiquiditySourceBuilder<L>
@@ -239,7 +241,16 @@ where
 			config,
 			logger,
 			event_queue,
+			webhook_client: None,
+			webhook_url: None,
 		}
+	}
+
+	/// Configures a webhook URL for direct HTTP delivery of payment notifications.
+	pub(crate) fn webhook(&mut self, url: String) -> &mut Self {
+		self.webhook_client = Some(reqwest::Client::new());
+		self.webhook_url = Some(url);
+		self
 	}
 
 	pub(crate) fn lsps1_client(
@@ -366,6 +377,8 @@ where
 			config: self.config,
 			logger: self.logger,
 			event_queue: self.event_queue,
+			webhook_client: self.webhook_client,
+			webhook_url: self.webhook_url,
 		})
 	}
 }
@@ -387,6 +400,8 @@ where
 	config: Arc<Config>,
 	logger: L,
 	event_queue: Arc<EventQueue<L>>,
+	webhook_client: Option<reqwest::Client>,
+	webhook_url: Option<String>,
 }
 
 impl<L: Deref + Clone> LiquiditySource<L>
@@ -1203,11 +1218,35 @@ where
 				}
 			},
 			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::SendWebhook { counterparty_node_id, payment_hash }) => {
-				if let Err(e) = self
-					.event_queue
-					.add_event(crate::event::Event::SendWebhook { node_id: counterparty_node_id, payment_hash }).await
-				{
-					log_error!(self.logger, "Failed to queue webhook event: {:?}", e);
+				if let (Some(client), Some(url)) = (&self.webhook_client, &self.webhook_url) {
+					let mut json_body = HashMap::new();
+					json_body.insert("nodeId", counterparty_node_id.to_string());
+					json_body.insert("paymentHash", payment_hash.to_string());
+					log_info!(
+						self.logger,
+						"Sending webhook directly for payment_hash={} node={}",
+						payment_hash,
+						counterparty_node_id
+					);
+					if let Err(e) = client.post(url).json(&json_body).send().await {
+						log_error!(self.logger, "Direct webhook POST failed: {:?}", e);
+					}
+				} else {
+					// Fallback: route through event queue (slower path via S3 persistence).
+					log_info!(
+						self.logger,
+						"No direct webhook configured, falling back to event queue"
+					);
+					if let Err(e) = self
+						.event_queue
+						.add_event(crate::event::Event::SendWebhook {
+							node_id: counterparty_node_id,
+							payment_hash,
+						})
+						.await
+					{
+						log_error!(self.logger, "Failed to queue webhook event: {:?}", e);
+					}
 				}
 			},
 			e => {
