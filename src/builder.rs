@@ -136,6 +136,8 @@ struct LiquiditySourceConfig {
 	lsps4_client: Option<LSPS4ClientConfig>,
 	// Act as an LSPS4 service.
 	lsps4_service: Option<LSPS4ServiceConfig>,
+	// URL for direct webhook delivery from LiquiditySource.
+	webhook_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -522,6 +524,15 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps4_service = Some(service_config);
+		self
+	}
+
+	/// Sets a webhook URL for direct HTTP delivery of payment notifications from the
+	/// liquidity source, bypassing the event queue.
+	pub fn set_webhook_url(&mut self, url: String) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.webhook_url = Some(url);
 		self
 	}
 
@@ -1781,6 +1792,10 @@ fn build_with_store_internal(
 			lsc.lsps4_service
 				.as_ref()
 				.map(|config| liquidity_source_builder.lsps4_service(config.clone()));
+
+			if let Some(ref url) = lsc.webhook_url {
+				liquidity_source_builder.webhook(url.clone());
+			}
 
 			let liquidity_source = runtime
 				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
