@@ -502,6 +502,12 @@ where
 		}
 	}
 
+	pub(crate) fn process_pending_htlcs(&self) {
+		if let Some(lsps4_service_handler) = self.liquidity_manager.lsps4_service_handler() {
+			lsps4_service_handler.process_pending_htlcs();
+		}
+	}
+
 	pub(crate) async fn handle_next_event(&self) {
 		match self.liquidity_manager.next_event_async().await {
 			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
