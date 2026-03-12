@@ -171,6 +171,19 @@ use crate::scoring::setup_background_pathfinding_scores_sync;
 
 const HTLC_EXPIRY_CHECK_INTERVAL_SECS: u64 = 5;
 
+/// How often to retry forwarding deferred HTLCs (e.g., after channel_reestablish completes).
+///
+/// After `peer_connected`, channels are not usable until `channel_reestablish` finishes (~1s).
+/// HTLCs that arrive during this window are deferred and retried by `process_pending_htlcs`
+/// on this interval. Lower values reduce payment latency for serverless SDK clients that
+/// disconnect shortly after reconnecting (typically ~20s for webhook-driven flows).
+///
+/// Cost per tick: O(connected_peers × stored_htlcs) — acquires a read lock on the peer set
+/// and a mutex lock + full scan on the HTLC store per peer. At ~100 peers with a handful of
+/// pending HTLCs this is negligible. Profile if connected peer count exceeds ~10k, and
+/// consider indexing pending HTLCs by peer at that point rather than scanning.
+const PENDING_HTLC_RETRY_INTERVAL_SECS: u64 = 1;
+
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
 
@@ -625,6 +638,15 @@ impl Node {
 			let liquidity_handler = Arc::clone(&liquidity_source);
 			let liquidity_logger = Arc::clone(&self.logger);
 			self.runtime.spawn_background_task(async move {
+				let mut pending_htlc_interval =
+					tokio::time::interval(Duration::from_secs(PENDING_HTLC_RETRY_INTERVAL_SECS));
+				let mut expiry_check_interval =
+					tokio::time::interval(Duration::from_secs(HTLC_EXPIRY_CHECK_INTERVAL_SECS));
+				pending_htlc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				expiry_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				// First tick fires immediately; consume it so we don't run at t=0.
+				pending_htlc_interval.tick().await;
+				expiry_check_interval.tick().await;
 				loop {
 					tokio::select! {
 						_ = stop_liquidity_handler.changed() => {
@@ -634,8 +656,10 @@ impl Node {
 							);
 							return;
 						}
-						_ = tokio::time::sleep(Duration::from_secs(HTLC_EXPIRY_CHECK_INTERVAL_SECS)) => {
+						_ = pending_htlc_interval.tick() => {
 							liquidity_handler.process_pending_htlcs();
+						}
+						_ = expiry_check_interval.tick() => {
 							liquidity_handler.handle_expired_htlcs().await;
 						}
 						_ = liquidity_handler.handle_next_event() => {}
