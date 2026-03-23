@@ -1506,6 +1506,13 @@ where
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
+				// Clear LSPS4 liquidity cooldown so the timer can retry.
+				if let Some(ref counterparty) = counterparty_node_id {
+					if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+						liquidity_source.handle_channel_closed(counterparty).await;
+					}
+				}
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -1780,6 +1787,11 @@ where
 				if let Err(e) = self.wallet.cancel_tx(&tx) {
 					log_error!(self.logger, "Failed reclaiming unused addresses: {}", e);
 					return Err(ReplayEvent());
+				}
+
+				// Reset LSPS4 cooldown so the timer can retry after cooldown period.
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.handle_splice_failed(&counterparty_node_id).await;
 				}
 
 				let event = Event::SpliceFailed {
