@@ -580,6 +580,19 @@ impl Wallet {
 	pub(crate) fn select_confirmed_utxos(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
 	) -> Result<Vec<FundingTxInput>, ()> {
+		self.select_utxos_inner(must_spend, must_pay_to, fee_rate, true)
+	}
+
+	pub(crate) fn select_utxos(
+		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
+	) -> Result<Vec<FundingTxInput>, ()> {
+		self.select_utxos_inner(must_spend, must_pay_to, fee_rate, false)
+	}
+
+	fn select_utxos_inner(
+		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
+		confirmed_only: bool,
+	) -> Result<Vec<FundingTxInput>, ()> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		debug_assert!(matches!(
 			locked_wallet.public_descriptor(KeychainKind::External),
@@ -607,12 +620,14 @@ impl Wallet {
 		}
 
 		tx_builder.fee_rate(fee_rate);
-		tx_builder.exclude_unconfirmed();
+		if confirmed_only {
+			tx_builder.exclude_unconfirmed();
+		}
 
 		tx_builder
 			.finish()
 			.map_err(|e| {
-				log_error!(self.logger, "Failed to select confirmed UTXOs: {}", e);
+				log_error!(self.logger, "Failed to select UTXOs: {}", e);
 			})?
 			.unsigned_tx
 			.input

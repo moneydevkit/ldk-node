@@ -2012,7 +2012,7 @@ where
 
 		let inputs = self
 			.wallet
-			.select_confirmed_utxos(vec![shared_input], &[shared_output], fee_rate)
+			.select_utxos(vec![shared_input], &[shared_output], fee_rate)
 			.map_err(|()| APIError::APIMisuseError {
 				err: "Insufficient confirmed UTXOs for splice".to_string(),
 			})?;
