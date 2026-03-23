@@ -2315,3 +2315,31 @@ impl LSPS1Liquidity {
 		Ok(response)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_is_splice_already_pending() {
+		let pending_err = APIError::APIMisuseError {
+			err: "Channel abc cannot be spliced, as it has already a splice pending".to_string(),
+		};
+		assert!(is_splice_already_pending(&pending_err));
+
+		let other_err = APIError::APIMisuseError {
+			err: "Channel abc cannot be spliced as it is either pending open/close".to_string(),
+		};
+		assert!(!is_splice_already_pending(&other_err));
+
+		let zero_err = APIError::APIMisuseError {
+			err: "Channel abc cannot be spliced; contribution cannot be zero".to_string(),
+		};
+		assert!(!is_splice_already_pending(&zero_err));
+
+		let channel_unavailable = APIError::ChannelUnavailable {
+			err: "some error".to_string(),
+		};
+		assert!(!is_splice_already_pending(&channel_unavailable));
+	}
+}
