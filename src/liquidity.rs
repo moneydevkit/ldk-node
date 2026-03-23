@@ -1146,6 +1146,16 @@ where
 							their_network_key
 						);
 					},
+					Err(ref e) if is_channel_not_yet_usable(e) => {
+						// Channel exists but is reestablishing. Don't fall back to
+						// create_channel - the 1Hz timer will retry once usable (~1s).
+						log_info!(
+							self.logger,
+							"LSPS4 splice deferred on channel {} with peer {} (channel reestablishing)",
+							channel_id,
+							their_network_key
+						);
+					},
 					Err(e) => {
 						log_error!(
 							self.logger,
@@ -2174,6 +2184,10 @@ where
 
 fn is_splice_already_pending(err: &APIError) -> bool {
 	matches!(err, APIError::APIMisuseError { ref err } if err.contains("splice pending"))
+}
+
+fn is_channel_not_yet_usable(err: &APIError) -> bool {
+	matches!(err, APIError::APIMisuseError { ref err } if err.contains("pending open/close"))
 }
 
 #[derive(Debug, Clone)]
