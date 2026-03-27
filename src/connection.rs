@@ -6,8 +6,10 @@
 // accordance with one or both of these licenses.
 
 use std::collections::hash_map::{self, HashMap};
-use std::net::ToSocketAddrs;
+use std::future::Future;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +27,7 @@ where
 	pending_connections:
 		Mutex<HashMap<PublicKey, Vec<tokio::sync::oneshot::Sender<Result<(), Error>>>>>,
 	peer_manager: Arc<PeerManager>,
+	socks5_proxy_addr: Option<SocketAddr>,
 	logger: L,
 }
 
@@ -32,9 +35,11 @@ impl<L: Deref + Clone + Sync + Send> ConnectionManager<L>
 where
 	L::Target: LdkLogger,
 {
-	pub(crate) fn new(peer_manager: Arc<PeerManager>, logger: L) -> Self {
+	pub(crate) fn new(
+		peer_manager: Arc<PeerManager>, socks5_proxy_addr: Option<SocketAddr>, logger: L,
+	) -> Self {
 		let pending_connections = Mutex::new(HashMap::new());
-		Self { pending_connections, peer_manager, logger }
+		Self { pending_connections, peer_manager, socks5_proxy_addr, logger }
 	}
 
 	pub(crate) async fn connect_peer_if_necessary(
@@ -78,15 +83,29 @@ where
 				Error::InvalidSocketAddress
 			})?;
 
-		let connection_future = lightning_net_tokio::connect_outbound(
-			Arc::clone(&self.peer_manager),
-			node_id,
-			socket_addr,
-		);
+		let connection_future =
+			if let Some(proxy_addr) = self.socks5_proxy_addr {
+				log_info!(self.logger, "Connecting via SOCKS5 proxy {} to peer: {}@{}", proxy_addr, node_id, addr);
+				lightning_net_tokio::connect_outbound_via_socks5(
+					Arc::clone(&self.peer_manager),
+					node_id,
+					socket_addr,
+					proxy_addr,
+				)
+				.await
+				.map(|f| Box::pin(f) as Pin<Box<dyn Future<Output = ()> + Send>>)
+			} else {
+				lightning_net_tokio::connect_outbound(
+					Arc::clone(&self.peer_manager),
+					node_id,
+					socket_addr,
+				)
+				.await
+				.map(|f| Box::pin(f) as Pin<Box<dyn Future<Output = ()> + Send>>)
+			};
 
-		let res = match connection_future.await {
-			Some(connection_closed_future) => {
-				let mut connection_closed_future = Box::pin(connection_closed_future);
+		let res = match connection_future {
+			Some(mut connection_closed_future) => {
 				loop {
 					tokio::select! {
 						_ = &mut connection_closed_future => {

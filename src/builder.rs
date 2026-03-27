@@ -606,6 +606,12 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Sets the SOCKS5 proxy address for all outbound connections.
+	pub fn set_socks5_proxy(&mut self, addr: std::net::SocketAddr) -> &mut Self {
+		self.config.socks5_proxy_addr = Some(addr);
+		self
+	}
+
 	/// Sets the role of the node in an asynchronous payments context.
 	///
 	/// See <https://github.com/lightning/bolts/pull/1149> for more information about the async payments protocol.
@@ -1133,6 +1139,11 @@ impl ArcedNodeBuilder {
 	/// The provided alias must be a valid UTF-8 string and no longer than 32 bytes in total.
 	pub fn set_node_alias(&self, node_alias: String) -> Result<(), BuildError> {
 		self.inner.write().unwrap().set_node_alias(node_alias).map(|_| ())
+	}
+
+	/// Sets the SOCKS5 proxy address for all outbound connections.
+	pub fn set_socks5_proxy(&self, addr: std::net::SocketAddr) {
+		self.inner.write().unwrap().set_socks5_proxy(addr);
 	}
 
 	/// Sets the role of the node in an asynchronous payments context.
@@ -1940,7 +1951,7 @@ fn build_with_store_internal(
 	);
 
 	let connection_manager =
-		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
+		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), config.socks5_proxy_addr, Arc::clone(&logger)));
 
 	// read_output_sweeper (peer_info was already read in the spawned group above)
 	let step_start = Instant::now();

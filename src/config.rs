@@ -8,6 +8,7 @@
 //! Objects for configuring the node.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
@@ -188,6 +189,11 @@ pub struct Config {
 	/// The parameters used to configure the [`lightning::routing::scoring::ProbabilisticScorer`]
 	/// used by the node.
 	pub scoring_parameters: ProbabilisticScoringParameters,
+	/// Optional SOCKS5 proxy address for all outbound connections (peer, Esplora, Electrum).
+	///
+	/// When set, Lightning peer connections and chain-source HTTP requests will be routed
+	/// through the given SOCKS5 proxy.
+	pub socks5_proxy_addr: Option<SocketAddr>,
 }
 
 impl Default for Config {
@@ -203,6 +209,7 @@ impl Default for Config {
 			route_parameters: None,
 			node_alias: None,
 			scoring_parameters: ProbabilisticScoringParameters::default(),
+			socks5_proxy_addr: None,
 		}
 	}
 }
