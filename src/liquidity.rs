@@ -16,10 +16,15 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::Transaction;
 use chrono::Utc;
+use bitcoin::Amount;
+use lightning::events::bump_transaction::Input;
 use lightning::events::HTLCHandlingFailureType;
+use lightning::ln::chan_utils::{make_funding_redeemscript, FUNDING_TRANSACTION_WITNESS_WEIGHT};
 use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
+use lightning::ln::funding::SpliceContribution;
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::types::ChannelId;
+use lightning::util::errors::APIError;
 use lightning::routing::router::{RouteHint, RouteHintHop};
 use lightning::util::logger::Logger as LdkLogger;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, InvoiceBuilder, RoutingFees};
@@ -52,6 +57,7 @@ use crate::runtime::Runtime;
 use crate::types::{
 	Broadcaster, ChannelManager, DynStore, KeysManager, LiquidityManager, PeerManager, Wallet,
 };
+use crate::fee_estimator::{self, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::{total_anchor_channels_reserve_sats, Config, Error};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -204,6 +210,7 @@ where
 	keys_manager: Arc<KeysManager>,
 	chain_source: Arc<ChainSource>,
 	tx_broadcaster: Arc<Broadcaster>,
+	fee_estimator: Arc<OnchainFeeEstimator>,
 	kv_store: Arc<DynStore>,
 	config: Arc<Config>,
 	logger: L,
@@ -218,7 +225,8 @@ where
 {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>,
+		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>,
+		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>,
 		config: Arc<Config>, logger: L, event_queue: Arc<EventQueue<L>>,
 	) -> Self {
 		let lsps1_client = None;
@@ -237,6 +245,7 @@ where
 			keys_manager,
 			chain_source,
 			tx_broadcaster,
+			fee_estimator,
 			kv_store,
 			config,
 			logger,
@@ -373,6 +382,7 @@ where
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
 			keys_manager: self.keys_manager,
+			fee_estimator: self.fee_estimator,
 			liquidity_manager,
 			config: self.config,
 			logger: self.logger,
@@ -396,6 +406,7 @@ where
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
 	keys_manager: Arc<KeysManager>,
+	fee_estimator: Arc<OnchainFeeEstimator>,
 	liquidity_manager: Arc<LiquidityManager<L>>,
 	config: Arc<Config>,
 	logger: L,
@@ -1089,6 +1100,83 @@ where
 						self.logger,
 						"Received unexpected LSPS4Client::InvoiceParametersReady event!"
 					);
+				}
+			},
+			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::SpliceChannel {
+				their_network_key,
+				channel_id,
+				user_channel_id: _,
+				amt_to_forward_msat,
+				channel_count,
+			}) => {
+				if self.liquidity_manager.lsps4_service_handler().is_none() {
+					log_error!(self.logger, "Failed to handle SpliceChannel: LSPS4 service not configured.");
+					return;
+				};
+
+				let service_config = if let Some(service_config) =
+					self.lsps4_service.as_ref().map(|s| s.service_config.clone())
+				{
+					service_config
+				} else {
+					log_error!(self.logger, "Failed to handle SpliceChannel: LSPS4 service not configured.");
+					return;
+				};
+
+				let over_provisioning_msat = (amt_to_forward_msat
+					* service_config.channel_over_provisioning_ppm as u64)
+					/ 1_000_000;
+				let splice_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
+
+				match self.splice_channel_for_lsps4(channel_id, their_network_key, splice_amount_sats) {
+					Ok(()) => {
+						log_info!(
+							self.logger,
+							"LSPS4 splice initiated on channel {} with peer {} for {}sats",
+							channel_id,
+							their_network_key,
+							splice_amount_sats
+						);
+					},
+					Err(ref e) if is_splice_already_pending(e) => {
+						log_info!(
+							self.logger,
+							"LSPS4 splice already pending on channel {} with peer {}, skipping",
+							channel_id,
+							their_network_key
+						);
+					},
+					Err(ref e) if is_channel_not_yet_usable(e) => {
+						// Channel exists but is reestablishing. Don't fall back to
+						// create_channel - the 1Hz timer will retry once usable (~1s).
+						log_info!(
+							self.logger,
+							"LSPS4 splice deferred on channel {} with peer {} (channel reestablishing)",
+							channel_id,
+							their_network_key
+						);
+					},
+					Err(e) => {
+						log_error!(
+							self.logger,
+							"LSPS4 splice failed on channel {} with peer {}: {:?}, falling back to new channel",
+							channel_id,
+							their_network_key,
+							e
+						);
+						if let Err(e) = self.open_channel_for_lsps4(
+							their_network_key,
+							amt_to_forward_msat,
+							channel_count,
+						) {
+							log_error!(
+								self.logger,
+								"LSPS4 fallback channel open also failed for {}: {:?}",
+								their_network_key,
+								e
+							);
+						}
+					},
 				}
 			},
 			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::OpenChannel {
@@ -1881,6 +1969,225 @@ where
 			}
 		}
 	}
+
+	/// Splice into an existing channel for LSPS4. Mirrors Node::splice_in().
+	/// Returns raw APIError so the caller can distinguish "splice already pending."
+	fn splice_channel_for_lsps4(
+		&self, channel_id: ChannelId, counterparty_node_id: PublicKey,
+		splice_amount_sats: u64,
+	) -> Result<(), APIError> {
+		let channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = channels.iter().find(|c| c.channel_id == channel_id).ok_or(
+			APIError::APIMisuseError {
+				err: format!("Channel {} not found for splice", channel_id),
+			},
+		)?;
+
+		const EMPTY_SCRIPT_SIG_WEIGHT: u64 =
+			1 /* empty script_sig */ * bitcoin::constants::WITNESS_SCALE_FACTOR as u64;
+
+		let dummy_pubkey = PublicKey::from_slice(&[2; 33]).unwrap();
+
+		let funding_txo = channel_details.funding_txo.ok_or_else(|| APIError::APIMisuseError {
+			err: "Channel not yet ready for splice".to_string(),
+		})?;
+
+		let shared_input = Input {
+			outpoint: funding_txo.into_bitcoin_outpoint(),
+			previous_utxo: bitcoin::TxOut {
+				value: Amount::from_sat(channel_details.channel_value_satoshis),
+				script_pubkey: make_funding_redeemscript(&dummy_pubkey, &dummy_pubkey).to_p2wsh(),
+			},
+			satisfaction_weight: EMPTY_SCRIPT_SIG_WEIGHT + FUNDING_TRANSACTION_WITNESS_WEIGHT,
+		};
+
+		let shared_output = bitcoin::TxOut {
+			value: shared_input.previous_utxo.value + Amount::from_sat(splice_amount_sats),
+			script_pubkey: make_funding_redeemscript(&dummy_pubkey, &dummy_pubkey).to_p2wsh(),
+		};
+
+		let fee_rate =
+			self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+
+		let inputs = self
+			.wallet
+			.select_utxos(vec![shared_input], &[shared_output], fee_rate)
+			.map_err(|()| APIError::APIMisuseError {
+				err: "Insufficient confirmed UTXOs for splice".to_string(),
+			})?;
+
+		let change_address =
+			self.wallet.get_new_internal_address().map_err(|e| APIError::APIMisuseError {
+				err: format!("Failed to get change address: {:?}", e),
+			})?;
+
+		let contribution = SpliceContribution::SpliceIn {
+			value: Amount::from_sat(splice_amount_sats),
+			inputs,
+			change_script: Some(change_address.script_pubkey()),
+		};
+
+		let funding_feerate_per_kw: u32 = match fee_rate.to_sat_per_kwu().try_into() {
+			Ok(fee_rate) => fee_rate,
+			Err(_) => {
+				debug_assert!(false);
+				fee_estimator::get_fallback_rate_for_target(ConfirmationTarget::ChannelFunding)
+			},
+		};
+
+		self.channel_manager
+			.splice_channel(
+				&channel_id,
+				&counterparty_node_id,
+				contribution,
+				funding_feerate_per_kw,
+				None,
+			)
+			.map_err(|e| {
+				// Cancel change address reservation on failure
+				let tx = bitcoin::Transaction {
+					version: bitcoin::transaction::Version::TWO,
+					lock_time: bitcoin::absolute::LockTime::ZERO,
+					input: vec![],
+					output: vec![bitcoin::TxOut {
+						value: Amount::ZERO,
+						script_pubkey: change_address.script_pubkey(),
+					}],
+				};
+				let _ = self.wallet.cancel_tx(&tx);
+				e
+			})
+	}
+
+	/// Open a channel for LSPS4. Extracted from the OpenChannel event handler
+	/// so it can be reused as a splice fallback.
+	fn open_channel_for_lsps4(
+		&self, their_network_key: PublicKey, amt_to_forward_msat: u64,
+		channel_count: usize,
+	) -> Result<(), Error> {
+		let service_config = if let Some(service_config) =
+			self.lsps4_service.as_ref().map(|s| s.service_config.clone())
+		{
+			service_config
+		} else {
+			log_error!(self.logger, "Failed to handle LSPS4 open channel: LSPS4 service not configured.");
+			return Err(Error::LiquiditySourceUnavailable);
+		};
+
+		let init_features = if let Some(peer_manager) =
+			self.peer_manager.read().unwrap().as_ref()
+		{
+			if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
+				peer.init_features
+			} else {
+				log_error!(
+					self.logger,
+					"Failed to open LSPS4 channel to {} due to peer not being connected.",
+					their_network_key,
+				);
+				return Err(Error::ConnectionFailed);
+			}
+		} else {
+			log_error!(self.logger, "Failed to handle LSPS4 open channel: peer manager unavailable.");
+			return Err(Error::LiquiditySourceUnavailable);
+		};
+
+		let over_provisioning_msat = (amt_to_forward_msat
+			* service_config.channel_over_provisioning_ppm as u64)
+			/ 1_000_000;
+		let mut channel_amount_sats = std::cmp::max(
+			(amt_to_forward_msat + over_provisioning_msat) / 1000,
+			service_config.min_channel_size_msat / 1000,
+		);
+		if !service_config.channel_size_tiers.is_empty() {
+			let tier_index = std::cmp::min(
+				channel_count,
+				service_config.channel_size_tiers.len() - 1,
+			);
+			if let Some(tier_value_sats) =
+				service_config.channel_size_tiers.get(tier_index).copied()
+			{
+				channel_amount_sats = channel_amount_sats.max(tier_value_sats);
+			}
+		}
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+		let required_funds_sats = channel_amount_sats
+			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+				if init_features.requires_anchors_zero_fee_htlc_tx()
+					&& !c.trusted_peers_no_reserve.contains(&their_network_key)
+				{
+					c.per_channel_reserve_sats
+				} else {
+					0
+				}
+			});
+		if spendable_amount_sats < required_funds_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, channel_amount_sats
+			);
+			return Err(Error::InsufficientFunds);
+		}
+
+		let mut config = self.channel_manager.get_current_config().clone();
+		debug_assert_eq!(
+			config
+				.channel_handshake_config
+				.max_inbound_htlc_value_in_flight_percent_of_channel,
+			100
+		);
+		debug_assert!(config.accept_forwards_to_priv_channels);
+		config.channel_config.forwarding_fee_base_msat = 0;
+		config.channel_config.forwarding_fee_proportional_millionths = 0;
+		config.channel_handshake_config.min_their_channel_reserve_satoshis = 0;
+		config.channel_handshake_config.their_channel_reserve_proportional_millionths = 0;
+
+		let user_channel_id = 0;
+
+		self.channel_manager
+			.create_channel(
+				their_network_key,
+				channel_amount_sats,
+				0,
+				user_channel_id,
+				None,
+				Some(config),
+			)
+			.map(|_| ())
+			.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to open LSPS4 channel to {}: {:?}",
+					their_network_key,
+					e
+				);
+				Error::ChannelCreationFailed
+			})
+	}
+
+	pub(crate) async fn handle_splice_failed(&self, counterparty_node_id: &PublicKey) {
+		if let Some(lsps4_service_handler) = self.liquidity_manager.lsps4_service_handler() {
+			lsps4_service_handler.liquidity_action_reset_cooldown(counterparty_node_id);
+		}
+	}
+
+	pub(crate) async fn handle_channel_closed(&self, counterparty_node_id: &PublicKey) {
+		if let Some(lsps4_service_handler) = self.liquidity_manager.lsps4_service_handler() {
+			lsps4_service_handler.liquidity_action_failed(counterparty_node_id);
+		}
+	}
+}
+
+fn is_splice_already_pending(err: &APIError) -> bool {
+	matches!(err, APIError::APIMisuseError { ref err } if err.contains("splice pending"))
+}
+
+fn is_channel_not_yet_usable(err: &APIError) -> bool {
+	matches!(err, APIError::APIMisuseError { ref err } if err.contains("pending open/close"))
 }
 
 #[derive(Debug, Clone)]
@@ -2020,5 +2327,33 @@ impl LSPS1Liquidity {
 			.runtime
 			.block_on(async move { liquidity_source.lsps1_check_order_status(order_id).await })?;
 		Ok(response)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_is_splice_already_pending() {
+		let pending_err = APIError::APIMisuseError {
+			err: "Channel abc cannot be spliced, as it has already a splice pending".to_string(),
+		};
+		assert!(is_splice_already_pending(&pending_err));
+
+		let other_err = APIError::APIMisuseError {
+			err: "Channel abc cannot be spliced as it is either pending open/close".to_string(),
+		};
+		assert!(!is_splice_already_pending(&other_err));
+
+		let zero_err = APIError::APIMisuseError {
+			err: "Channel abc cannot be spliced; contribution cannot be zero".to_string(),
+		};
+		assert!(!is_splice_already_pending(&zero_err));
+
+		let channel_unavailable = APIError::ChannelUnavailable {
+			err: "some error".to_string(),
+		};
+		assert!(!is_splice_already_pending(&channel_unavailable));
 	}
 }
