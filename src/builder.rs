@@ -1944,6 +1944,7 @@ fn build_with_store_internal(
 		node_metrics,
 		om_mailbox,
 		async_payments_role,
+		forward_counters: Arc::new(crate::ForwardCounters::new()),
 	})
 }
 

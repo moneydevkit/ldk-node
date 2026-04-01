@@ -86,6 +86,7 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
+pub mod forward_metrics;
 mod ffi;
 mod gossip;
 pub mod graph;
@@ -124,6 +125,7 @@ use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
+pub use forward_metrics::ForwardCounters;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 #[cfg(feature = "uniffi")]
@@ -221,6 +223,7 @@ pub struct Node {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
+	forward_counters: Arc<ForwardCounters>,
 }
 
 impl Node {
@@ -572,6 +575,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			Arc::clone(&self.forward_counters),
 		));
 
 		// Setup background processing
@@ -737,6 +741,14 @@ impl Node {
 		log_info!(self.logger, "Shutdown complete.");
 		*is_running_lock = false;
 		Ok(())
+	}
+
+	/// Returns the HTLC forward counters for metrics collection.
+	///
+	/// These are monotonic atomic counters incremented inside the event handler for
+	/// `PaymentForwarded` (success) and `HTLCHandlingFailed` (failure) events.
+	pub fn forward_counters(&self) -> &ForwardCounters {
+		&self.forward_counters
 	}
 
 	/// Returns the status of the [`Node`].
