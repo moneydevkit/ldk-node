@@ -40,6 +40,7 @@ use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
+use crate::forward_metrics::ForwardCounters;
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
@@ -505,6 +506,7 @@ where
 	static_invoice_store: Option<StaticInvoiceStore>,
 	onion_messenger: Arc<OnionMessenger>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
+	forward_counters: Arc<ForwardCounters>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -520,7 +522,7 @@ where
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
-		config: Arc<Config>,
+		config: Arc<Config>, forward_counters: Arc<ForwardCounters>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -539,6 +541,7 @@ where
 			static_invoice_store,
 			onion_messenger,
 			om_mailbox,
+			forward_counters,
 		}
 	}
 
@@ -1125,9 +1128,40 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
+			LdkEvent::HTLCHandlingFailed {
+				prev_channel_id,
+				failure_type,
+				failure_reason,
+			} => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_htlc_handling_failed(failure_type).await;
+					liquidity_source
+						.handle_htlc_handling_failed(failure_type.clone())
+						.await;
+				}
+
+				match &failure_type {
+					lightning::events::HTLCHandlingFailureType::Forward {
+						channel_id: next_channel_id,
+						..
+					} => {
+						let channels = self.channel_manager.list_channels();
+						if let Some(dir) = ForwardCounters::classify(
+							&channels,
+							&prev_channel_id,
+							next_channel_id,
+						) {
+							let is_downstream = matches!(
+								failure_reason,
+								Some(lightning::events::HTLCHandlingFailureReason::Downstream)
+							);
+							self.forward_counters.record_failure(dir, is_downstream);
+						}
+					},
+					lightning::events::HTLCHandlingFailureType::UnknownNextHop { .. }
+					| lightning::events::HTLCHandlingFailureType::InvalidForward { .. } => {
+						self.forward_counters.record_invalid_scid();
+					},
+					_ => {},
 				}
 			},
 			LdkEvent::SpendableOutputs { outputs, channel_id } => {
@@ -1308,10 +1342,11 @@ where
 				claim_from_onchain_tx,
 				outbound_amount_forwarded_msat,
 			} => {
+				let channels = self.channel_manager.list_channels();
+
 				{
 					let read_only_network_graph = self.network_graph.read_only();
 					let nodes = read_only_network_graph.nodes();
-					let channels = self.channel_manager.list_channels();
 
 					let node_str = |channel_id: &Option<ChannelId>| {
 						channel_id
@@ -1372,6 +1407,14 @@ where
 					liquidity_source
 						.handle_payment_forwarded(next_channel_id, skimmed_fee_msat)
 						.await;
+				}
+
+				if let (Some(prev_cid), Some(next_cid)) = (prev_channel_id, next_channel_id) {
+					if let Some(dir) =
+						ForwardCounters::classify(&channels, &prev_cid, &next_cid)
+					{
+						self.forward_counters.record_success(dir);
+					}
 				}
 
 				let event = Event::PaymentForwarded {
