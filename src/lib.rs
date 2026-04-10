@@ -627,7 +627,7 @@ impl Node {
 				background_logger,
 				Some(background_scorer),
 				sleeper,
-				true,
+				false,
 				|| Some(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap()),
 			)
 			.await

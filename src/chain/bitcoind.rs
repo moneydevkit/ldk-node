@@ -41,7 +41,7 @@ use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
-const CHAIN_POLLING_INTERVAL_SECS: u64 = 2;
+const CHAIN_POLLING_INTERVAL_SECS: u64 = 30;
 const CHAIN_POLLING_TIMEOUT_SECS: u64 = 10;
 
 pub(super) struct BitcoindChainSource {
