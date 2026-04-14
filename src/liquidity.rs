@@ -879,8 +879,16 @@ where
 				let channel_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-				let spendable_amount_sats =
-					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+				let w = Arc::clone(&self.wallet);
+				let spendable_amount_sats = tokio::task::spawn_blocking(move || {
+					w.get_spendable_amount_sats(cur_anchor_reserve_sats)
+				})
+				.await
+				.unwrap_or_else(|e| {
+					log_error!(self.logger, "Failed to get spendable amount: {}", e);
+					Err(Error::WalletOperationFailed)
+				})
+				.unwrap_or(0);
 				let required_funds_sats = channel_amount_sats
 					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 						if init_features.requires_anchors_zero_fee_htlc_tx()
@@ -1242,8 +1250,16 @@ where
 				}
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-				let spendable_amount_sats =
-					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+				let w = Arc::clone(&self.wallet);
+				let spendable_amount_sats = tokio::task::spawn_blocking(move || {
+					w.get_spendable_amount_sats(cur_anchor_reserve_sats)
+				})
+				.await
+				.unwrap_or_else(|e| {
+					log_error!(self.logger, "Failed to get spendable amount: {}", e);
+					Err(Error::WalletOperationFailed)
+				})
+				.unwrap_or(0);
 				let required_funds_sats = channel_amount_sats
 					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 						if init_features.requires_anchors_zero_fee_htlc_tx()
