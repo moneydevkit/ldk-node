@@ -564,12 +564,18 @@ where
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
-				match self.wallet.create_funding_transaction(
-					output_script,
-					channel_amount,
-					confirmation_target,
-					locktime,
-				) {
+				let w = Arc::clone(&self.wallet);
+				let funding_res = tokio::task::spawn_blocking(move || {
+					w.create_funding_transaction(
+						output_script, channel_amount, confirmation_target, locktime,
+					)
+				})
+				.await
+				.unwrap_or_else(|e| {
+					log_error!(self.logger, "Failed to create funding transaction: {}", e);
+					Err(Error::WalletOperationFailed)
+				});
+				match funding_res {
 					Ok(final_tx) => {
 						let needs_manual_broadcast =
 							self.liquidity_source.as_ref().map_or(false, |ls| {

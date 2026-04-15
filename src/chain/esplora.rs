@@ -111,7 +111,15 @@ impl EsploraChainSource {
 				let now = Instant::now();
 				match $sync_future.await {
 					Ok(res) => match res {
-						Ok(update) => match onchain_wallet.apply_update(update) {
+						Ok(update) => {
+						let w = Arc::clone(&onchain_wallet);
+						let apply_res = tokio::task::spawn_blocking(move || w.apply_update(update))
+							.await
+							.map_err(|e| {
+								log_error!(self.logger, "Failed to apply wallet update: {}", e);
+								Error::WalletOperationFailed
+							})?;
+						match apply_res {
 							Ok(()) => {
 								log_info!(
 									self.logger,
@@ -135,6 +143,7 @@ impl EsploraChainSource {
 									Ok(())
 							},
 							Err(e) => Err(e),
+						}
 						},
 						Err(e) => match *e {
 							esplora_client::Error::Reqwest(he) => {

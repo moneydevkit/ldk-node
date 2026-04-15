@@ -436,7 +436,17 @@ impl BitcoindChainSource {
 		let cur_height = channel_manager.current_best_block().height;
 
 		let now = SystemTime::now();
-		let bdk_unconfirmed_txids = onchain_wallet.get_unconfirmed_txids();
+
+		let wallet_ref = onchain_wallet.clone();
+		let bdk_unconfirmed_txids = tokio::task::spawn_blocking(move || {
+			wallet_ref.get_unconfirmed_txids()
+		})
+		.await
+		.map_err(|e| {
+			log_error!(self.logger, "Failed to retrieve unconfirmed txids: {}", e);
+			Error::WalletOperationFailed
+		})?;
+
 		match self
 			.api_client
 			.get_updated_mempool_transactions(cur_height, bdk_unconfirmed_txids)
@@ -450,11 +460,18 @@ impl BitcoindChainSource {
 					evicted_txids.len(),
 					now.elapsed().unwrap().as_millis()
 				);
-				onchain_wallet.apply_mempool_txs(unconfirmed_txs, evicted_txids).unwrap_or_else(
-					|e| {
-						log_error!(self.logger, "Failed to apply mempool transactions: {:?}", e);
-					},
-				);
+
+				let apply_res = tokio::task::spawn_blocking(move || {
+					onchain_wallet.apply_mempool_txs(unconfirmed_txs, evicted_txids)
+				})
+				.await
+				.map_err(|e| {
+					log_error!(self.logger, "Applying mempool transactions panicked: {}", e);
+					Error::WalletOperationFailed
+				})?;
+				apply_res.unwrap_or_else(|e| {
+					log_error!(self.logger, "Failed to apply mempool transactions: {:?}", e);
+				});
 			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to poll for mempool transactions: {:?}", e);
