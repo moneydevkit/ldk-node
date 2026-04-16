@@ -666,7 +666,9 @@ impl Node {
 						_ = expiry_check_interval.tick() => {
 							liquidity_handler.handle_expired_htlcs().await;
 						}
-						_ = liquidity_handler.handle_next_event() => {}
+						_ = liquidity_handler.handle_next_event() => {
+							log_info!(liquidity_logger, "[select!] handle_next_event branch completed");
+						}
 					}
 				}
 			});
