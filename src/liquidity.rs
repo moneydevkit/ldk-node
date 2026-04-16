@@ -61,6 +61,10 @@ use crate::fee_estimator::{self, ConfirmationTarget, FeeEstimator, OnchainFeeEst
 use crate::{total_anchor_channels_reserve_sats, Config, Error};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
+// Client webhooks may intentionally keep the HTTP response open while the node wakes
+// and processes incoming payments. This timeout is only to clean up genuinely stuck
+// requests without blocking LSPS4 liquidity actions.
+const DIRECT_WEBHOOK_TIMEOUT_SECS: u64 = 70;
 
 const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
 pub(crate) const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
@@ -1430,15 +1434,36 @@ where
 					let mut json_body = HashMap::new();
 					json_body.insert("nodeId", counterparty_node_id.to_string());
 					json_body.insert("paymentHash", payment_hash.to_string());
+					let counterparty_node_id = counterparty_node_id.to_string();
+					let payment_hash = payment_hash.to_string();
+					let client = client.clone();
+					let url = url.clone();
 					log_info!(
 						self.logger,
 						"Sending webhook directly for payment_hash={} node={}",
 						payment_hash,
 						counterparty_node_id
 					);
-					if let Err(e) = client.post(url).json(&json_body).send().await {
-						log_error!(self.logger, "Direct webhook POST failed: {:?}", e);
-					}
+					let _ = tokio::spawn(async move {
+						match tokio::time::timeout(
+							Duration::from_secs(DIRECT_WEBHOOK_TIMEOUT_SECS),
+							client.post(&url).json(&json_body).send(),
+						)
+						.await
+						{
+							Ok(Ok(_)) => {},
+							Ok(Err(e)) => {
+								log::error!("Direct webhook POST failed: {:?}", e);
+							},
+							Err(_) => {
+								log::error!(
+									"Direct webhook POST timed out for payment_hash={} node={}",
+									payment_hash,
+									counterparty_node_id
+								);
+							},
+						}
+					});
 				} else {
 					// Fallback: route through event queue (slower path via S3 persistence).
 					log_info!(
