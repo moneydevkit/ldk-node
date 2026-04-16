@@ -1192,12 +1192,6 @@ where
 				amt_to_forward_msat,
 				channel_count
 			}) => {
-				let event_start = std::time::Instant::now();
-				log_info!(self.logger,
-					"[LSPS4] OpenChannel event received for peer {} - amt_to_forward: {}msat, channel_count: {}",
-					their_network_key, amt_to_forward_msat, channel_count
-				);
-
 				if self.liquidity_manager.lsps4_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS4ServiceEvent as LSPS4 liquidity service was not configured.",);
 					return;
@@ -1219,11 +1213,13 @@ where
 					if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
 						peer.init_features
 					} else {
+						// TODO: We just silently fail here. Eventually we will need to remember
+						// the pending requests and regularly retry opening the channel until we
+						// succeed.
 						log_error!(
 							self.logger,
-							"Failed to open LSPS4 channel to {} due to peer not being not connected (after {}ms).",
+							"Failed to open LSPS4 channel to {} due to peer not being not connected.",
 							their_network_key,
-							event_start.elapsed().as_millis(),
 						);
 						return;
 					}
@@ -1232,11 +1228,6 @@ where
 					log_error!(self.logger, "Failed to handle LSPS4ServiceEvent as peer manager isn't available. This should never happen.",);
 					return;
 				};
-
-				log_info!(self.logger,
-					"[LSPS4] OpenChannel: peer {} connected, checking wallet balance (after {}ms)...",
-					their_network_key, event_start.elapsed().as_millis()
-				);
 
 				// Fail if we have insufficient onchain funds available.
 				let over_provisioning_msat = (amt_to_forward_msat
@@ -1260,7 +1251,6 @@ where
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let w = Arc::clone(&self.wallet);
-				let wallet_start = std::time::Instant::now();
 				let spendable_amount_sats = tokio::task::spawn_blocking(move || {
 					w.get_spendable_amount_sats(cur_anchor_reserve_sats)
 				})
@@ -1270,11 +1260,6 @@ where
 					Err(Error::WalletOperationFailed)
 				})
 				.unwrap_or(0);
-				let wallet_ms = wallet_start.elapsed().as_millis();
-				log_info!(self.logger,
-					"[LSPS4] OpenChannel: wallet check took {}ms for peer {} - spendable: {}sats, channel_amount: {}sats (total event time: {}ms)",
-					wallet_ms, their_network_key, spendable_amount_sats, channel_amount_sats, event_start.elapsed().as_millis()
-				);
 				let required_funds_sats = channel_amount_sats
 					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 						if init_features.requires_anchors_zero_fee_htlc_tx()
@@ -1287,13 +1272,17 @@ where
 					});
 				if spendable_amount_sats < required_funds_sats {
 					log_error!(self.logger,
-						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats (after {}ms)",
-						spendable_amount_sats, channel_amount_sats, event_start.elapsed().as_millis()
+						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+						spendable_amount_sats, channel_amount_sats
 					);
+					// TODO: We just silently fail here. Eventually we will need to remember
+					// the pending requests and regularly retry opening the channel until we
+					// succeed.
 					return;
 				}
 
 				let mut config = self.channel_manager.get_current_config().clone();
+
 
 				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
 				debug_assert_eq!(
@@ -1312,6 +1301,7 @@ where
 				config.channel_handshake_config.min_their_channel_reserve_satoshis = 0;
 				config.channel_handshake_config.their_channel_reserve_proportional_millionths = 0;
 
+				// TODO: does LSPS4 service need to track this? seems like no?
 				let user_channel_id = 0;
 
 				match self.channel_manager.create_channel(
@@ -1322,20 +1312,16 @@ where
 					None,
 					Some(config),
 				) {
-					Ok(_) => {
-						log_info!(self.logger,
-							"[LSPS4] OpenChannel: successfully opened channel to {} for {}sats (total event time: {}ms)",
-							their_network_key, channel_amount_sats, event_start.elapsed().as_millis()
-						);
-					},
+					Ok(_) => {},
 					Err(e) => {
+						// TODO: We just silently fail here. Eventually we will need to remember
+						// the pending requests and regularly retry opening the channel until we
+						// succeed.
 						log_error!(
 							self.logger,
-							"Failed to open LSPS4 channel to {} for {}sats: {:?} (after {}ms)",
+							"Failed to open LSPS4 channel to {}: {:?}",
 							their_network_key,
-							channel_amount_sats,
-							e,
-							event_start.elapsed().as_millis()
+							e
 						);
 						return;
 					},
