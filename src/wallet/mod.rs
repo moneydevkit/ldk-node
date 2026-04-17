@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::descriptor::ExtendedDescriptor;
@@ -318,9 +319,33 @@ impl Wallet {
 	}
 
 	pub(crate) fn get_balances(
-		&self, total_anchor_channels_reserve_sats: u64,
+		&self, total_anchor_channels_reserve_sats: u64, caller: &str,
 	) -> Result<(u64, u64), Error> {
-		let balance = self.inner.lock().unwrap().balance();
+		let lock_wait_start = Instant::now();
+		log_info!(
+			self.logger,
+			"Wallet get_balances starting (caller={}, reserve_sats={})",
+			caller,
+			total_anchor_channels_reserve_sats,
+		);
+		let locked_wallet = self.inner.lock().unwrap();
+		let lock_wait_ms = lock_wait_start.elapsed().as_millis();
+		log_info!(
+			self.logger,
+			"Wallet get_balances acquired wallet lock in {}ms (caller={})",
+			lock_wait_ms,
+			caller,
+		);
+		let balance_start = Instant::now();
+		let balance = locked_wallet.balance();
+		let balance_ms = balance_start.elapsed().as_millis();
+		log_info!(
+			self.logger,
+			"Wallet get_balances fetched BDK balance in {}ms (caller={})",
+			balance_ms,
+			caller,
+		);
+		drop(locked_wallet);
 
 		// Make sure `list_confirmed_utxos` returns at least one `Utxo` we could use to spend/bump
 		// Anchors if we have any confirmed amounts.
@@ -332,7 +357,15 @@ impl Wallet {
 			);
 		}
 
-		self.get_balances_inner(balance, total_anchor_channels_reserve_sats)
+		let balances = self.get_balances_inner(balance, total_anchor_channels_reserve_sats)?;
+		log_info!(
+			self.logger,
+			"Wallet get_balances computed balances total_sats={} spendable_sats={} (caller={})",
+			balances.0,
+			balances.1,
+			caller,
+		);
+		Ok(balances)
 	}
 
 	fn get_balances_inner(
@@ -347,9 +380,9 @@ impl Wallet {
 	}
 
 	pub(crate) fn get_spendable_amount_sats(
-		&self, total_anchor_channels_reserve_sats: u64,
+		&self, total_anchor_channels_reserve_sats: u64, caller: &str,
 	) -> Result<u64, Error> {
-		self.get_balances(total_anchor_channels_reserve_sats).map(|(_, s)| s)
+		self.get_balances(total_anchor_channels_reserve_sats, caller).map(|(_, s)| s)
 	}
 
 	pub(crate) fn parse_and_validate_address(&self, address: &Address) -> Result<Address, Error> {

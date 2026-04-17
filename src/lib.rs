@@ -651,6 +651,7 @@ impl Node {
 				// First tick fires immediately; consume it so we don't run at t=0.
 				pending_htlc_interval.tick().await;
 				expiry_check_interval.tick().await;
+				let lm = liquidity_handler.liquidity_manager();
 				loop {
 					tokio::select! {
 						_ = stop_liquidity_handler.changed() => {
@@ -666,7 +667,9 @@ impl Node {
 						_ = expiry_check_interval.tick() => {
 							liquidity_handler.handle_expired_htlcs().await;
 						}
-						_ = liquidity_handler.handle_next_event() => {}
+						event = lm.next_event_async() => {
+							liquidity_handler.handle_event(event).await;
+						}
 					}
 				}
 			});
@@ -1173,7 +1176,7 @@ impl Node {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let spendable_amount_sats =
-			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats, "check_channel_funds").unwrap_or(0);
 
 		// Fail early if we have less than the channel value available.
 		if spendable_amount_sats < amount_sats {
@@ -1635,7 +1638,7 @@ impl Node {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let (total_onchain_balance_sats, spendable_onchain_balance_sats) =
-			self.wallet.get_balances(cur_anchor_reserve_sats).unwrap_or((0, 0));
+			self.wallet.get_balances(cur_anchor_reserve_sats, "list_balances").unwrap_or((0, 0));
 
 		let total_anchor_channels_reserve_sats =
 			std::cmp::min(cur_anchor_reserve_sats, total_onchain_balance_sats);
