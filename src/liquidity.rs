@@ -889,7 +889,7 @@ where
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let w = Arc::clone(&self.wallet);
 				let spendable_amount_sats = tokio::task::spawn_blocking(move || {
-					w.get_spendable_amount_sats(cur_anchor_reserve_sats)
+					w.get_spendable_amount_sats(cur_anchor_reserve_sats, "lsps2_open_channel")
 				})
 				.await
 				.unwrap_or_else(|e| {
@@ -897,6 +897,12 @@ where
 					Err(Error::WalletOperationFailed)
 				})
 				.unwrap_or(0);
+				log_info!(
+					self.logger,
+					"LSPS2 OpenChannel wallet check returned spendable_amount_sats={} for peer {}",
+					spendable_amount_sats,
+					their_network_key,
+				);
 				let required_funds_sats = channel_amount_sats
 					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 						if init_features.requires_anchors_zero_fee_htlc_tx()
@@ -1200,6 +1206,14 @@ where
 				amt_to_forward_msat,
 				channel_count
 			}) => {
+				log_info!(
+					self.logger,
+					"Handling LSPS4 OpenChannel for peer {} (amt_to_forward_msat={}, channel_count={}, thread_id={:?})",
+					their_network_key,
+					amt_to_forward_msat,
+					channel_count,
+					std::thread::current().id(),
+				);
 				if self.liquidity_manager.lsps4_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS4ServiceEvent as LSPS4 liquidity service was not configured.",);
 					return;
@@ -1236,6 +1250,11 @@ where
 					log_error!(self.logger, "Failed to handle LSPS4ServiceEvent as peer manager isn't available. This should never happen.",);
 					return;
 				};
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel peer {} is connected; computing channel size",
+					their_network_key,
+				);
 
 				// Fail if we have insufficient onchain funds available.
 				let over_provisioning_msat = (amt_to_forward_msat
@@ -1256,18 +1275,63 @@ where
 						channel_amount_sats = channel_amount_sats.max(tier_value_sats);
 					}
 				}
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel peer {} computed channel_amount_sats={} (amt_to_forward_msat={}, over_provisioning_ppm={}, min_channel_size_msat={}, tier_count={})",
+					their_network_key,
+					channel_amount_sats,
+					amt_to_forward_msat,
+					service_config.channel_over_provisioning_ppm,
+					service_config.min_channel_size_msat,
+					service_config.channel_size_tiers.len(),
+				);
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let w = Arc::clone(&self.wallet);
-				let spendable_amount_sats = tokio::task::spawn_blocking(move || {
-					w.get_spendable_amount_sats(cur_anchor_reserve_sats)
+				let wallet_check_peer = their_network_key;
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel spawning wallet check for peer {} (reserve_sats={}, thread_id={:?})",
+					wallet_check_peer,
+					cur_anchor_reserve_sats,
+					std::thread::current().id(),
+				);
+				let spendable_amount_result = tokio::task::spawn_blocking(move || {
+					let blocking_thread_id = format!("{:?}", std::thread::current().id());
+					let result = w.get_spendable_amount_sats(cur_anchor_reserve_sats, "lsps4_open_channel");
+					(blocking_thread_id, result)
 				})
-				.await
-				.unwrap_or_else(|e| {
+				.await;
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel wallet check join completed for peer {} (join_ok={}, thread_id={:?})",
+					their_network_key,
+					spendable_amount_result.is_ok(),
+					std::thread::current().id(),
+				);
+				let (blocking_thread_id, spendable_amount_result) = spendable_amount_result
+					.unwrap_or_else(|e| {
+						log_error!(self.logger, "Failed to get spendable amount: {}", e);
+						(format!("{:?}", std::thread::current().id()), Err(Error::WalletOperationFailed))
+					});
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel wallet check blocking task returned for peer {} (blocking_thread_id={}, result={:?})",
+					their_network_key,
+					blocking_thread_id,
+					spendable_amount_result,
+				);
+				let spendable_amount_sats = spendable_amount_result.unwrap_or_else(|e| {
 					log_error!(self.logger, "Failed to get spendable amount: {}", e);
-					Err(Error::WalletOperationFailed)
+					0
 				})
-				.unwrap_or(0);
+				;
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel wallet check returned spendable_amount_sats={} for peer {}",
+					spendable_amount_sats,
+					their_network_key,
+				);
 				let required_funds_sats = channel_amount_sats
 					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 						if init_features.requires_anchors_zero_fee_htlc_tx()
@@ -1278,16 +1342,32 @@ where
 							0
 						}
 					});
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel peer {} computed required_funds_sats={} (channel_amount_sats={}, anchor_reserve_applied={})",
+					their_network_key,
+					required_funds_sats,
+					channel_amount_sats,
+					required_funds_sats.saturating_sub(channel_amount_sats),
+				);
 				if spendable_amount_sats < required_funds_sats {
 					log_error!(self.logger,
-						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-						spendable_amount_sats, channel_amount_sats
+						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats, Peer: {}",
+						spendable_amount_sats, required_funds_sats, their_network_key
 					);
 					// TODO: We just silently fail here. Eventually we will need to remember
 					// the pending requests and regularly retry opening the channel until we
 					// succeed.
 					return;
 				}
+				log_info!(
+					self.logger,
+					"LSPS4 OpenChannel peer {} passed funding checks (channel_amount_sats={}, required_funds_sats={}, spendable_amount_sats={})",
+					their_network_key,
+					channel_amount_sats,
+					required_funds_sats,
+					spendable_amount_sats,
+				);
 
 				let mut config = self.channel_manager.get_current_config().clone();
 
@@ -1311,6 +1391,13 @@ where
 
 				// TODO: does LSPS4 service need to track this? seems like no?
 				let user_channel_id = 0;
+				log_info!(
+					self.logger,
+					"Calling create_channel for LSPS4 peer {} (channel_amount_sats={}, user_channel_id={})",
+					their_network_key,
+					channel_amount_sats,
+					user_channel_id,
+				);
 
 				match self.channel_manager.create_channel(
 					their_network_key,
@@ -1320,7 +1407,14 @@ where
 					None,
 					Some(config),
 				) {
-					Ok(_) => {},
+					Ok(_) => {
+						log_info!(
+							self.logger,
+							"LSPS4 create_channel accepted for peer {} (channel_amount_sats={})",
+							their_network_key,
+							channel_amount_sats,
+						);
+					},
 					Err(e) => {
 						// TODO: We just silently fail here. Eventually we will need to remember
 						// the pending requests and regularly retry opening the channel until we
@@ -2111,6 +2205,14 @@ where
 		&self, their_network_key: PublicKey, amt_to_forward_msat: u64,
 		channel_count: usize,
 	) -> Result<(), Error> {
+		log_info!(
+			self.logger,
+			"Entering open_channel_for_lsps4 for peer {} (amt_to_forward_msat={}, channel_count={}, thread_id={:?})",
+			their_network_key,
+			amt_to_forward_msat,
+			channel_count,
+			std::thread::current().id(),
+		);
 		let service_config = if let Some(service_config) =
 			self.lsps4_service.as_ref().map(|s| s.service_config.clone())
 		{
@@ -2156,10 +2258,32 @@ where
 				channel_amount_sats = channel_amount_sats.max(tier_value_sats);
 			}
 		}
+		log_info!(
+			self.logger,
+			"open_channel_for_lsps4 peer {} computed channel_amount_sats={} (amt_to_forward_msat={}, over_provisioning_ppm={}, min_channel_size_msat={}, tier_count={})",
+			their_network_key,
+			channel_amount_sats,
+			amt_to_forward_msat,
+			service_config.channel_over_provisioning_ppm,
+			service_config.min_channel_size_msat,
+			service_config.channel_size_tiers.len(),
+		);
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		log_info!(
+			self.logger,
+			"open_channel_for_lsps4 peer {} fetching spendable_amount_sats with reserve_sats={}",
+			their_network_key,
+			cur_anchor_reserve_sats,
+		);
 		let spendable_amount_sats =
-			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats, "lsps4_fallback").unwrap_or(0);
+		log_info!(
+			self.logger,
+			"open_channel_for_lsps4 peer {} wallet returned spendable_amount_sats={}",
+			their_network_key,
+			spendable_amount_sats,
+		);
 		let required_funds_sats = channel_amount_sats
 			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 				if init_features.requires_anchors_zero_fee_htlc_tx()
@@ -2170,13 +2294,29 @@ where
 					0
 				}
 			});
+		log_info!(
+			self.logger,
+			"open_channel_for_lsps4 peer {} computed required_funds_sats={} (channel_amount_sats={}, anchor_reserve_applied={})",
+			their_network_key,
+			required_funds_sats,
+			channel_amount_sats,
+			required_funds_sats.saturating_sub(channel_amount_sats),
+		);
 		if spendable_amount_sats < required_funds_sats {
 			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, channel_amount_sats
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats, Peer: {}",
+				spendable_amount_sats, required_funds_sats, their_network_key
 			);
 			return Err(Error::InsufficientFunds);
 		}
+		log_info!(
+			self.logger,
+			"open_channel_for_lsps4 peer {} passed funding checks (channel_amount_sats={}, required_funds_sats={}, spendable_amount_sats={})",
+			their_network_key,
+			channel_amount_sats,
+			required_funds_sats,
+			spendable_amount_sats,
+		);
 
 		let mut config = self.channel_manager.get_current_config().clone();
 		debug_assert_eq!(
@@ -2192,6 +2332,13 @@ where
 		config.channel_handshake_config.their_channel_reserve_proportional_millionths = 0;
 
 		let user_channel_id = 0;
+		log_info!(
+			self.logger,
+			"open_channel_for_lsps4 calling create_channel for peer {} (channel_amount_sats={}, user_channel_id={})",
+			their_network_key,
+			channel_amount_sats,
+			user_channel_id,
+		);
 
 		self.channel_manager
 			.create_channel(
@@ -2202,7 +2349,14 @@ where
 				None,
 				Some(config),
 			)
-			.map(|_| ())
+			.map(|_| {
+				log_info!(
+					self.logger,
+					"open_channel_for_lsps4 create_channel accepted for peer {} (channel_amount_sats={})",
+					their_network_key,
+					channel_amount_sats,
+				);
+			})
 			.map_err(|e| {
 				log_error!(
 					self.logger,

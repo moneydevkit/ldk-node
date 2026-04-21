@@ -1176,7 +1176,7 @@ impl Node {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let spendable_amount_sats =
-			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats, "check_channel_funds").unwrap_or(0);
 
 		// Fail early if we have less than the channel value available.
 		if spendable_amount_sats < amount_sats {
@@ -1638,7 +1638,7 @@ impl Node {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let (total_onchain_balance_sats, spendable_onchain_balance_sats) =
-			self.wallet.get_balances(cur_anchor_reserve_sats).unwrap_or((0, 0));
+			self.wallet.get_balances(cur_anchor_reserve_sats, "list_balances").unwrap_or((0, 0));
 
 		let total_anchor_channels_reserve_sats =
 			std::cmp::min(cur_anchor_reserve_sats, total_onchain_balance_sats);

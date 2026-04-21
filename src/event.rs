@@ -1220,7 +1220,7 @@ where
 						);
 						let spendable_amount_sats = self
 							.wallet
-							.get_spendable_amount_sats(cur_anchor_reserve_sats)
+							.get_spendable_amount_sats(cur_anchor_reserve_sats, "anchor_reserve_check")
 							.unwrap_or(0);
 
 						let required_amount_sats = if anchor_channels_config
