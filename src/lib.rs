@@ -651,6 +651,7 @@ impl Node {
 				// First tick fires immediately; consume it so we don't run at t=0.
 				pending_htlc_interval.tick().await;
 				expiry_check_interval.tick().await;
+				let lm = liquidity_handler.liquidity_manager();
 				loop {
 					tokio::select! {
 						_ = stop_liquidity_handler.changed() => {
@@ -666,7 +667,9 @@ impl Node {
 						_ = expiry_check_interval.tick() => {
 							liquidity_handler.handle_expired_htlcs().await;
 						}
-						_ = liquidity_handler.handle_next_event() => {}
+						event = lm.next_event_async() => {
+							liquidity_handler.handle_event(event).await;
+						}
 					}
 				}
 			});

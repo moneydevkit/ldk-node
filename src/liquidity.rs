@@ -519,8 +519,12 @@ where
 		}
 	}
 
-	pub(crate) async fn handle_next_event(&self) {
-		match self.liquidity_manager.next_event_async().await {
+	/// Handles a single liquidity event. Must be called from a context that
+	/// guarantees the future runs to completion (e.g. a `select!` handler block),
+	/// since event processing includes `.await` points that are not
+	/// cancellation-safe.
+	pub(crate) async fn handle_event(&self, event: LiquidityEvent) {
+		match event {
 			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
 				request_id,
 				counterparty_node_id,
