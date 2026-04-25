@@ -2,9 +2,21 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use lightning::routing::scoring::ChannelLiquidities;
+use lightning::routing::scoring::{
+	ChannelLiquidities, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
+};
 use lightning::util::ser::Readable;
 use lightning::{log_error, log_info, log_trace};
+
+/// The parameters used to configure the [`lightning::routing::scoring::ProbabilisticScorer`]
+/// used by the node.
+#[derive(Debug, Clone, Default)]
+pub struct ProbabilisticScoringParameters {
+	/// The fee parameters used by the router to compute path penalties.
+	pub fee_params: ProbabilisticScoringFeeParameters,
+	/// The decay parameters used by the scorer to reduce certainty of liquidity information.
+	pub decay_params: ProbabilisticScoringDecayParameters,
+}
 
 use crate::config::{
 	EXTERNAL_PATHFINDING_SCORES_SYNC_INTERVAL, EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS,

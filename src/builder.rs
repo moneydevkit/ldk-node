@@ -73,6 +73,7 @@ use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
 use crate::router::{LSPS4BlindedPathConfig, LSPS4Router};
 use crate::runtime::Runtime;
+use crate::scoring::ProbabilisticScoringParameters;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeysManager, MessageRouter,
@@ -620,6 +621,14 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Sets the parameters for the scoring algorithm.
+	pub fn set_scoring_params(
+		&mut self, scoring_params: ProbabilisticScoringParameters,
+	) -> &mut Self {
+		self.config.scoring_parameters = scoring_params;
+		self
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self) -> Result<Node, BuildError> {
@@ -1133,6 +1142,11 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_async_payments_role(role).map(|_| ())
 	}
 
+	/// Sets the parameters for the scoring algorithm.
+	pub fn set_scoring_params(&self, scoring_params: ProbabilisticScoringParameters) {
+		self.inner.write().unwrap().set_scoring_params(scoring_params);
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self) -> Result<Arc<Node>, BuildError> {
@@ -1577,8 +1591,12 @@ fn build_with_store_internal(
 		Ok(scorer) => scorer,
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
-				let params = ProbabilisticScoringDecayParameters::default();
-				ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
+				let decay_params = config.scoring_parameters.decay_params;
+				ProbabilisticScorer::new(
+					decay_params,
+					Arc::clone(&network_graph),
+					Arc::clone(&logger),
+				)
 			} else {
 				log_error!(logger, "Failed to read scoring data from store: {}", e);
 				return Err(BuildError::ReadFailed);
@@ -1606,7 +1624,7 @@ fn build_with_store_internal(
 		},
 	}
 
-	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
+	let scoring_fee_params = config.scoring_parameters.fee_params.clone();
 	let inner_router = DefaultRouter::new(
 		Arc::clone(&network_graph),
 		Arc::clone(&logger),

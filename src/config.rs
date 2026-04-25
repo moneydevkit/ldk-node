@@ -20,6 +20,7 @@ use lightning::util::config::{
 };
 
 use crate::logger::LogLevel;
+use crate::scoring::ProbabilisticScoringParameters;
 
 // Config defaults
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
@@ -184,6 +185,9 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub route_parameters: Option<RouteParametersConfig>,
+	/// The parameters used to configure the [`lightning::routing::scoring::ProbabilisticScorer`]
+	/// used by the node.
+	pub scoring_parameters: ProbabilisticScoringParameters,
 }
 
 impl Default for Config {
@@ -198,6 +202,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			route_parameters: None,
 			node_alias: None,
+			scoring_parameters: ProbabilisticScoringParameters::default(),
 		}
 	}
 }

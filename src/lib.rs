@@ -103,6 +103,8 @@ mod tx_broadcaster;
 mod types;
 mod wallet;
 
+pub use scoring::ProbabilisticScoringParameters;
+
 use std::default::Default;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, RwLock};
