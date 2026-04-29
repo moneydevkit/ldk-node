@@ -1798,6 +1798,17 @@ impl Node {
 		self.keys_manager.verify_signature(msg, sig, pkey)
 	}
 
+	/// Returns the current fee-rate estimate (in sats per 1000 weight units) for channel
+	/// funding transactions.
+	///
+	/// Useful for callers that need to budget on-chain fees for splice or open-channel
+	/// operations without round-tripping through the on-chain wallet API.
+	pub fn channel_funding_fee_sats_per_kwu(&self) -> u64 {
+		self.fee_estimator
+			.estimate_fee_rate(ConfirmationTarget::ChannelFunding)
+			.to_sat_per_kwu()
+	}
+
 	/// Exports the current state of the scorer. The result can be shared with and merged by light nodes that only have
 	/// a limited view of the network.
 	pub fn export_pathfinding_scores(&self) -> Result<Vec<u8>, Error> {
