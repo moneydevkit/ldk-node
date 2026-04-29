@@ -57,6 +57,10 @@ impl EsploraChainSource {
 			client_builder = client_builder.header(header_name, header_value);
 		}
 
+		if let Some(proxy_addr) = config.socks5_proxy_addr {
+			client_builder = client_builder.proxy(&format!("socks5://{}", proxy_addr));
+		}
+
 		let esplora_client = client_builder.build_async().unwrap();
 		let tx_sync =
 			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
