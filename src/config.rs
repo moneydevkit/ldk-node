@@ -120,6 +120,7 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 /// | `log_level`                            | Debug              |
 /// | `anchor_channels_config`               | Some(..)           |
 /// | `route_parameters`                   | None               |
+/// | `inbound_splice_minimum_depth`         | Some(6)            |
 ///
 /// See [`AnchorChannelsConfig`] and [`RouteParametersConfig`] for more information regarding their
 /// respective default values.
@@ -184,6 +185,21 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub route_parameters: Option<RouteParametersConfig>,
+	/// The minimum confirmation depth required before we send `splice_locked` for splices
+	/// initiated by our counterparty.
+	///
+	/// On 0-conf channels, `splice_locked` would otherwise be sent immediately after
+	/// `tx_signatures` are exchanged. That is safe for self-initiated splices (we built the
+	/// funding output) but unsafe for counterparty-initiated splices: the counterparty could
+	/// double-spend the splice transaction after we've already locked it in. This setting gates
+	/// counterparty-initiated splices behind a configurable confirmation depth.
+	///
+	/// Has no effect on self-initiated splices or on non-0-conf channels (which already enforce
+	/// their own `minimum_depth`).
+	///
+	/// If set to `None`, counterparty-initiated splices inherit the channel's `minimum_depth`,
+	/// which is `0` for 0-conf channels.
+	pub inbound_splice_minimum_depth: Option<u32>,
 }
 
 impl Default for Config {
@@ -198,6 +214,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			route_parameters: None,
 			node_alias: None,
+			inbound_splice_minimum_depth: Some(6),
 		}
 	}
 }
@@ -325,6 +342,7 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.manually_accept_inbound_channels = true;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
+	user_config.channel_handshake_config.splice_minimum_depth = config.inbound_splice_minimum_depth;
 	user_config.reject_inbound_splices = false;
 
 	if may_announce_channel(config).is_err() {
