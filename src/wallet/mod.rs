@@ -577,6 +577,85 @@ impl Wallet {
 		Ok(txid)
 	}
 
+	/// Computes the maximum amount that can be spliced into a channel using all
+	/// confirmed wallet UTXOs, given a fixed foreign-contributed input set
+	/// (typically the channel's existing funding outpoint).
+	///
+	/// Builds a dry-run drain transaction: foreign UTXOs in `must_spend` are
+	/// added as `add_foreign_utxo`, all confirmed wallet UTXOs are drained,
+	/// the entire selected value goes to `drain_script` (sized to match the
+	/// real splice funding output), and `cur_anchor_reserve_sats` is reserved
+	/// as a wallet change output if non-dust. The returned amount equals
+	/// drain output value − total foreign input value, i.e. the wallet's net
+	/// contribution after splice fees and anchor reserves.
+	///
+	/// Returns `Err(())` if the resulting wallet contribution is below the
+	/// dust limit, or if BDK's coin selection fails for any other reason.
+	pub(crate) fn get_max_splice_in_amount(
+		&self, must_spend: Vec<Input>, drain_script: ScriptBuf,
+		cur_anchor_reserve_sats: u64, fee_rate: FeeRate,
+	) -> Result<Amount, ()> {
+		// Conservative dust threshold matching the legacy P2PKH dust limit at
+		// the standard 3 sat/vB relay-fee policy. P2WPKH (294) and P2WSH (330)
+		// would each be tighter;
+		const DUST_LIMIT_SATS: u64 = 546;
+
+		let mut locked_wallet = self.inner.lock().unwrap();
+		debug_assert!(matches!(
+			locked_wallet.public_descriptor(KeychainKind::External),
+			ExtendedDescriptor::Wpkh(_)
+		));
+		debug_assert!(matches!(
+			locked_wallet.public_descriptor(KeychainKind::Internal),
+			ExtendedDescriptor::Wpkh(_)
+		));
+
+		let reserve_change_script = (cur_anchor_reserve_sats > DUST_LIMIT_SATS)
+			.then(|| locked_wallet.peek_address(KeychainKind::Internal, 0).address.script_pubkey());
+
+		let mut tx_builder = locked_wallet.build_tx();
+		tx_builder.only_witness_utxo();
+
+		for input in &must_spend {
+			let psbt_input = psbt::Input {
+				witness_utxo: Some(input.previous_utxo.clone()),
+				..Default::default()
+			};
+			let weight = Weight::from_wu(input.satisfaction_weight);
+			tx_builder.add_foreign_utxo(input.outpoint, psbt_input, weight).map_err(|_| ())?;
+		}
+
+		tx_builder.drain_wallet().drain_to(drain_script.clone()).fee_rate(fee_rate);
+		tx_builder.exclude_unconfirmed();
+
+		if let Some(script) = reserve_change_script {
+			tx_builder.add_recipient(script, Amount::from_sat(cur_anchor_reserve_sats));
+		}
+
+		let psbt = tx_builder.finish().map_err(|e| {
+			log_error!(self.logger, "Failed to compute max splice-in amount: {}", e);
+		})?;
+
+		let drain_output_amount = psbt
+			.unsigned_tx
+			.output
+			.iter()
+			.find(|o| o.script_pubkey == drain_script)
+			.map(|o| o.value)
+			.ok_or(())?;
+
+		let foreign_input_total: Amount =
+			must_spend.iter().map(|i| i.previous_utxo.value).sum();
+
+		let wallet_contribution = drain_output_amount.checked_sub(foreign_input_total).ok_or(())?;
+
+		if wallet_contribution.to_sat() < DUST_LIMIT_SATS {
+			return Err(());
+		}
+
+		Ok(wallet_contribution)
+	}
+
 	pub(crate) fn select_confirmed_utxos(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
 	) -> Result<Vec<FundingTxInput>, ()> {
