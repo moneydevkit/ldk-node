@@ -1273,6 +1273,85 @@ impl Node {
 		)
 	}
 
+	/// Computes the maximum amount that can be spliced into an existing channel
+	/// using all confirmed on-chain wallet funds.
+	///
+	/// Performs a dry-run drain transaction at the current `ChannelFunding`
+	/// fee rate, accounting for splice tx fees and the anchor-channels reserve.
+	/// Returns the wallet's net contribution — directly suitable as the
+	/// `splice_amount_sats` argument to [`Self::splice_in`].
+	///
+	/// Returns `Error::InsufficientFunds` if the wallet's confirmed balance
+	/// (after reserves and fees) would be below the dust limit, and
+	/// `Error::ChannelSplicingFailed` if the channel is unknown or not yet
+	/// ready.
+	///
+	/// This is a query helper; it does not initiate any splice negotiation
+	/// or modify wallet state.
+	pub fn get_max_splice_in_amount(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+	) -> Result<u64, Error> {
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Channel not found for user_channel_id {} and counterparty {}",
+					user_channel_id,
+					counterparty_node_id
+				);
+				Error::ChannelSplicingFailed
+			})?;
+
+		const EMPTY_SCRIPT_SIG_WEIGHT: u64 =
+			1 /* empty script_sig */ * bitcoin::constants::WITNESS_SCALE_FACTOR as u64;
+
+		let dummy_pubkey = PublicKey::from_slice(&[2; 33]).unwrap();
+
+		let funding_txo = channel_details.funding_txo.ok_or_else(|| {
+			log_error!(
+				self.logger,
+				"Cannot compute max splice amount: channel not yet ready",
+			);
+			Error::ChannelSplicingFailed
+		})?;
+
+		let funding_script = make_funding_redeemscript(&dummy_pubkey, &dummy_pubkey).to_p2wsh();
+
+		let shared_input = Input {
+			outpoint: funding_txo.into_bitcoin_outpoint(),
+			previous_utxo: bitcoin::TxOut {
+				value: Amount::from_sat(channel_details.channel_value_satoshis),
+				script_pubkey: funding_script.clone(),
+			},
+			satisfaction_weight: EMPTY_SCRIPT_SIG_WEIGHT + FUNDING_TRANSACTION_WITNESS_WEIGHT,
+		};
+
+		let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+
+		self.wallet
+			.get_max_splice_in_amount(
+				vec![shared_input],
+				funding_script,
+				cur_anchor_reserve_sats,
+				fee_rate,
+			)
+			.map(|a| a.to_sat())
+			.map_err(|()| {
+				log_error!(
+					self.logger,
+					"Insufficient confirmed wallet funds for splice into channel {}",
+					user_channel_id,
+				);
+				Error::InsufficientFunds
+			})
+	}
+
 	/// Add funds from the on-chain wallet into an existing channel.
 	///
 	/// This provides for increasing a channel's outbound liquidity without re-balancing or closing
