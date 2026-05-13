@@ -22,7 +22,7 @@ use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, Payme
 use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore};
 
 // The default `final_cltv_expiry_delta` we apply when not set.
-const LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 144;
+pub(crate) const LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 144;
 
 /// A payment handler allowing to send spontaneous ("keysend") payments.
 ///

@@ -39,6 +39,8 @@ pub enum Error {
 	InvalidCustomTlvs,
 	/// Sending a payment probe has failed.
 	ProbeSendingFailed,
+	/// A route to the given destination could not be found.
+	RouteNotFound,
 	/// A channel could not be opened.
 	ChannelCreationFailed,
 	/// A channel could not be closed.
@@ -145,6 +147,7 @@ impl fmt::Display for Error {
 			Self::PaymentSendingFailed => write!(f, "Failed to send the given payment."),
 			Self::InvalidCustomTlvs => write!(f, "Failed to construct payment with custom TLVs."),
 			Self::ProbeSendingFailed => write!(f, "Failed to send the given payment probe."),
+			Self::RouteNotFound => write!(f, "Failed to find a route to the destination."),
 			Self::ChannelCreationFailed => write!(f, "Failed to create channel."),
 			Self::ChannelClosingFailed => write!(f, "Failed to close channel."),
 			Self::ChannelSplicingFailed => write!(f, "Failed to splice channel."),

@@ -144,6 +144,8 @@ use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::funding::SpliceContribution;
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
+use lightning::routing::router::{PaymentParameters, RouteParameters};
+pub use lightning::routing::router::{Route, RouteParametersConfig};
 use lightning::util::persist::KVStoreSync;
 use lightning_background_processor::process_events_async;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
@@ -152,7 +154,7 @@ use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
-	UnifiedQrPayment,
+	UnifiedQrPayment, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA,
 };
 use peer_store::{PeerInfo, PeerStore};
 use rand::Rng;
@@ -1886,6 +1888,59 @@ impl Node {
 		self.fee_estimator
 			.estimate_fee_rate(ConfirmationTarget::ChannelFunding)
 			.to_sat_per_kwu()
+	}
+
+	/// Finds a route to `payee` for `amount_msat` using the node's internal router.
+	///
+	/// Intended for callers that need to introspect routing fees ahead of
+	/// time (e.g. computing a max-sendable estimate by inverting per-hop fees).
+	///
+	/// `params` overrides the node-wide [`RouteParametersConfig`] when `Some`; otherwise
+	/// the value from [`Config::route_parameters`] is used.
+	///
+	/// [`Config::route_parameters`]: crate::config::Config::route_parameters
+	pub fn find_route(
+		&self, payee: PublicKey, amount_msat: u64, params: Option<RouteParametersConfig>,
+	) -> Result<Route, Error> {
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
+
+		let mut route_params = RouteParameters::from_payment_params_and_value(
+			PaymentParameters::from_node_id(payee, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA),
+			amount_msat,
+		);
+
+		if let Some(RouteParametersConfig {
+			max_total_routing_fee_msat,
+			max_total_cltv_expiry_delta,
+			max_path_count,
+			max_channel_saturation_power_of_half,
+		}) = params.as_ref().or(self.config.route_parameters.as_ref())
+		{
+			route_params.max_total_routing_fee_msat = *max_total_routing_fee_msat;
+			route_params.payment_params.max_total_cltv_expiry_delta = *max_total_cltv_expiry_delta;
+			route_params.payment_params.max_path_count = *max_path_count;
+			route_params.payment_params.max_channel_saturation_power_of_half =
+				*max_channel_saturation_power_of_half;
+		}
+
+		let payer = self.channel_manager.get_our_node_id();
+		let first_hops = self.channel_manager.list_usable_channels();
+		let first_hops_refs: Vec<&LdkChannelDetails> = first_hops.iter().collect();
+		let inflight_htlcs = self.channel_manager.compute_inflight_htlcs();
+
+		lightning::routing::router::Router::find_route(
+			&*self._router,
+			&payer,
+			&route_params,
+			Some(&first_hops_refs),
+			inflight_htlcs,
+		)
+		.map_err(|e| {
+			log_debug!(self.logger, "Failed to find route to {}: {}", payee, e);
+			Error::RouteNotFound
+		})
 	}
 
 	/// Exports the current state of the scorer. The result can be shared with and merged by light nodes that only have

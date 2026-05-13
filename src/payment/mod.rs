@@ -19,6 +19,7 @@ pub use bolt11::Bolt11Payment;
 pub use bolt12::Bolt12Payment;
 pub use onchain::OnchainPayment;
 pub use spontaneous::SpontaneousPayment;
+pub(crate) use spontaneous::LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA;
 pub use store::{
 	ConfirmationStatus, LSPFeeLimits, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };
