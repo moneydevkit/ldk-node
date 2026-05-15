@@ -144,8 +144,9 @@ use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::funding::SpliceContribution;
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
-use lightning::routing::router::{PaymentParameters, RouteParameters};
-pub use lightning::routing::router::{Route, RouteParametersConfig};
+pub use lightning::routing::router::{
+	PaymentParameters, Route, RouteParameters, RouteParametersConfig,
+};
 use lightning::util::persist::KVStoreSync;
 use lightning_background_processor::process_events_async;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
@@ -1890,39 +1891,21 @@ impl Node {
 			.to_sat_per_kwu()
 	}
 
-	/// Finds a route to `payee` for `amount_msat` using the node's internal router.
+	/// Finds a route for the given [`RouteParameters`] using the node's internal router.
 	///
-	/// Intended for callers that need to introspect routing fees ahead of
-	/// time (e.g. computing a max-sendable estimate by inverting per-hop fees).
+	/// Intended for callers that need to introspect routing fees ahead of time (e.g. computing
+	/// a max-sendable estimate). Build the parameters with [`PaymentParameters::from_node_id`]
+	/// for a clear-network pubkey, [`PaymentParameters::from_bolt11_invoice`] to fold a
+	/// BOLT11's private route hints into the cost function, or
+	/// [`PaymentParameters::from_bolt12_invoice`] for blinded payment paths.
 	///
-	/// `params` overrides the node-wide [`RouteParametersConfig`] when `Some`; otherwise
-	/// the value from [`Config::route_parameters`] is used.
+	/// The node-wide [`RouteParametersConfig`] in [`Config::route_parameters`] is not applied
+	/// automatically; overlay it onto `route_params` before calling if you want those caps.
 	///
 	/// [`Config::route_parameters`]: crate::config::Config::route_parameters
-	pub fn find_route(
-		&self, payee: PublicKey, amount_msat: u64, params: Option<RouteParametersConfig>,
-	) -> Result<Route, Error> {
+	pub fn find_route(&self, route_params: RouteParameters) -> Result<Route, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
-		}
-
-		let mut route_params = RouteParameters::from_payment_params_and_value(
-			PaymentParameters::from_node_id(payee, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA),
-			amount_msat,
-		);
-
-		if let Some(RouteParametersConfig {
-			max_total_routing_fee_msat,
-			max_total_cltv_expiry_delta,
-			max_path_count,
-			max_channel_saturation_power_of_half,
-		}) = params.as_ref().or(self.config.route_parameters.as_ref())
-		{
-			route_params.max_total_routing_fee_msat = *max_total_routing_fee_msat;
-			route_params.payment_params.max_total_cltv_expiry_delta = *max_total_cltv_expiry_delta;
-			route_params.payment_params.max_path_count = *max_path_count;
-			route_params.payment_params.max_channel_saturation_power_of_half =
-				*max_channel_saturation_power_of_half;
 		}
 
 		let payer = self.channel_manager.get_our_node_id();
@@ -1938,7 +1921,7 @@ impl Node {
 			inflight_htlcs,
 		)
 		.map_err(|e| {
-			log_debug!(self.logger, "Failed to find route to {}: {}", payee, e);
+			log_debug!(self.logger, "Failed to find route: {}", e);
 			Error::RouteNotFound
 		})
 	}
