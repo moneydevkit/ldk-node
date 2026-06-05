@@ -118,6 +118,95 @@ async fn channel_full_cycle_legacy_staticremotekey() {
 		.await;
 }
 
+// Regression test for phantom 0-conf channels (MDK-968). `create_funding_transaction` now
+// applies the built-and-signed funding tx back to the BDK wallet before returning, so its
+// inputs are reserved immediately rather than only after the next chain/mempool sync. This
+// prevents two opens between syncs from building funding transactions that double-spend the
+// same UTXO(s) — the root cause of unbacked 0-conf channels in production.
+//
+// Pre-fix, the second open below silently succeeded and produced a phantom channel. Post-fix,
+// node A's spendable balance reflects the spent UTXO without any sync, and the second open is
+// rejected up front with `InsufficientFunds`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn zero_conf_channel_funding_tx_no_double_spend() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	// Node A is the funder; B and C trust A for 0-conf channels.
+	println!("== Node A ==");
+	let config_a = random_config(false);
+	let node_a = setup_node(&chain_source, config_a, None);
+
+	println!("\n== Node B ==");
+	let mut config_b = random_config(false);
+	config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
+	let node_b = setup_node(&chain_source, config_b, None);
+
+	println!("\n== Node C ==");
+	let mut config_c = random_config(false);
+	config_c.node_config.trusted_peers_0conf.push(node_a.node_id());
+	let node_c = setup_node(&chain_source, config_c, None);
+
+	// Give node A exactly ONE confirmed UTXO. Any two funding txs built from this state must
+	// spend it, so they are double-spends of each other by construction.
+	let premine_amount_sat = 100_000;
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+
+	// Two channels of 70k each need 140k, but node A only owns 100k.
+	let funding_amount_sat = 70_000;
+
+	// First 0-conf channel A -> B. After ChannelPending the funding tx has been built, so the
+	// fix must already have reserved its inputs.
+	println!("\nA -- open_channel -> B");
+	node_a
+		.open_channel(
+			node_b.node_id(),
+			node_b.listening_addresses().unwrap().first().unwrap().clone(),
+			funding_amount_sat,
+			None,
+			None,
+		)
+		.unwrap();
+	expect_channel_pending_event!(node_a, node_b.node_id());
+	expect_channel_pending_event!(node_b, node_a.node_id());
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// Crucially WITHOUT a sync: the spendable balance must already reflect the spent UTXO,
+	// leaving only the unconfirmed change (< funding_amount). Pre-fix this still read 100k.
+	assert!(
+		node_a.list_balances().spendable_onchain_balance_sats < funding_amount_sat,
+		"funding inputs were not reserved at build time"
+	);
+
+	// Second 0-conf channel A -> C would double-spend the same UTXO. With inputs reserved the
+	// open must be rejected here instead of silently producing a phantom channel.
+	println!("\nA -- open_channel -> C");
+	assert_eq!(
+		Err(NodeError::InsufficientFunds),
+		node_a.open_channel(
+			node_c.node_id(),
+			node_c.listening_addresses().unwrap().first().unwrap().clone(),
+			funding_amount_sat,
+			None,
+			None,
+		)
+	);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+	node_c.stop().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn channel_open_fails_when_funds_insufficient() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
