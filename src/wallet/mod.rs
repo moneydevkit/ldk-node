@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::descriptor::ExtendedDescriptor;
@@ -266,15 +267,25 @@ impl Wallet {
 			},
 		}
 
+		let tx = psbt.extract_tx().map_err(|e| {
+			log_error!(self.logger, "Failed to extract transaction: {}", e);
+			e
+		})?;
+
+		// Record the funding tx in the wallet graph as unconfirmed *before* releasing the
+		// lock, so its inputs are immediately marked spent and a subsequent funding build
+		// cannot reselect the same UTXOs. Without this, two funding txs built between two
+		// chain syncs double-spend each other; the loser is rejected by the network while
+		// its 0-conf channel is already live, leaving an unbacked "phantom" channel. If the
+		// open later fails, `cancel_tx` rolls this back and frees the inputs again.
+		let last_seen =
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
+		locked_wallet.apply_unconfirmed_txs([(tx.clone(), last_seen)]);
+
 		let mut locked_persister = self.persister.lock().unwrap();
 		locked_wallet.persist(&mut locked_persister).map_err(|e| {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
-		})?;
-
-		let tx = psbt.extract_tx().map_err(|e| {
-			log_error!(self.logger, "Failed to extract transaction: {}", e);
-			e
 		})?;
 
 		Ok(tx)

@@ -585,6 +585,8 @@ where
 								)
 							});
 
+						let final_tx_for_rollback = final_tx.clone();
+
 						let result = if needs_manual_broadcast {
 							self.liquidity_source.as_ref().map(|ls| {
 								ls.lsps2_store_funding_transaction(
@@ -608,27 +610,38 @@ where
 
 						match result {
 							Ok(()) => {},
-							Err(APIError::APIMisuseError { err }) => {
-								log_error!(
-									self.logger,
-									"Encountered APIMisuseError, this should never happen: {}",
-									err
-								);
-								debug_assert!(false, "APIMisuseError: {}", err);
-							},
-							Err(APIError::ChannelUnavailable { err }) => {
-								log_error!(
-									self.logger,
-									"Failed to process funding transaction as channel went away before we could fund it: {}",
-									err
-								)
-							},
 							Err(err) => {
-								log_error!(
-									self.logger,
-									"Failed to process funding transaction: {:?}",
-									err
-								)
+								if let Err(e) = self.wallet.cancel_tx(&final_tx_for_rollback) {
+									log_error!(
+										self.logger,
+										"Failed to cancel funding transaction after open failure: {:?}",
+										e
+									);
+								}
+								match err {
+									APIError::APIMisuseError { err } => {
+										log_error!(
+											self.logger,
+											"Encountered APIMisuseError, this should never happen: {}",
+											err
+										);
+										debug_assert!(false, "APIMisuseError: {}", err);
+									},
+									APIError::ChannelUnavailable { err } => {
+										log_error!(
+											self.logger,
+											"Failed to process funding transaction as channel went away before we could fund it: {}",
+											err
+										)
+									},
+									err => {
+										log_error!(
+											self.logger,
+											"Failed to process funding transaction: {:?}",
+											err
+										)
+									},
+								}
 							},
 						}
 					},
