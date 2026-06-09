@@ -2267,7 +2267,9 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 							{
 								payer_succeeded = true;
 							},
-							Event::PaymentReceived { payment_id: pid, amount_msat: amt, .. } => {
+							Event::PaymentReceived {
+								payment_id: pid, amount_msat: amt, ..
+							} => {
 								assert_eq!(amt, amount_msat);
 								client_payment_id = pid;
 							},
@@ -2293,8 +2295,7 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 
 			assert!(payer_succeeded, "payer did not complete {}sat payment", amount_sat);
 			assert!(forwarded, "service did not forward {}sat payment", amount_sat);
-			let client_payment_id =
-				client_payment_id.expect("client did not receive the payment");
+			let client_payment_id = client_payment_id.expect("client did not receive the payment");
 
 			let payment = client_node.payment(&client_payment_id).unwrap();
 			assert!(matches!(payment.kind, PaymentKind::Bolt11Jit { .. }));

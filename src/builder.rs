@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::default::Default;
 use std::path::PathBuf;
@@ -14,12 +14,11 @@ use std::time::SystemTime;
 use std::{fmt, fs};
 
 use bdk_wallet::template::Bip84;
-use bdk_wallet::{KeychainKind, Wallet as BdkWallet, Update};
+use bdk_wallet::{KeychainKind, Wallet as BdkWallet};
 use bip39::Mnemonic;
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Network};
-use bitcoin_payment_instructions::onion_message_resolver::LDKOnionMessageDNSSECHrnResolver;
 use lightning::chain::{chainmonitor, BestBlock, Watch};
 use lightning::io::Cursor;
 use lightning::ln::channelmanager::{self, ChainParameters, ChannelManagerReadArgs};
@@ -39,7 +38,6 @@ use lightning::util::persist::{
 };
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
-use lightning_block_sync::BlockSource;
 use lightning_persister::fs_store::FilesystemStore;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
 
