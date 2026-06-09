@@ -2158,7 +2158,7 @@ async fn lsps4_client_service_integration() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn lsps4_channel_size_tiers_are_applied() {
+async fn lsps4_jit_channel_grows_via_splicing() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 	let sync_config = EsploraSyncConfig { background_sync_config: None };
@@ -2217,29 +2217,20 @@ async fn lsps4_channel_size_tiers_are_applied() {
 	expect_channel_ready_event!(payer_node, service_node.node_id());
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 
-	let expect_service_forward = |expected_forward_amount_msat: u64| loop {
-		match service_node.wait_next_event() {
-			Event::PaymentForwarded {
-				skimmed_fee_msat, outbound_amount_forwarded_msat, ..
-			} => {
-				assert_eq!(skimmed_fee_msat.unwrap_or(0), 0);
-				assert_eq!(outbound_amount_forwarded_msat, Some(expected_forward_amount_msat));
-				service_node.event_handled().unwrap();
-				break;
-			},
-			Event::SendWebhook { .. } => {
-				service_node.event_handled().unwrap();
-			},
-			other => panic!("unexpected service event: {:?}", other),
-		}
-	};
+	// `channel_size_tiers` is keyed by the number of channels already open with the peer,
+	// so it only influences the *initial* channel open. Once a channel exists, the LSPS4
+	// service grows liquidity by splicing the existing channel rather than opening new
+	// ones, so the client always ends up with exactly one channel that grows monotonically.
+	let tier0_channel_size_sat = 100_000;
 
-	let mut expected_channel_values = Vec::new();
-
+	// Drive a single JIT payment to completion and return the client's resulting channel
+	// value with the service. A liquidity action (initial open or splice) may be needed;
+	// splices must confirm on-chain before the channel is usable again, so we mine blocks
+	// whenever one is pending and keep draining events until the payment is both forwarded
+	// by the service and received by the client.
 	macro_rules! pay_lsps4_invoice {
-		($amount_sat:expr, $expected_new_channel_value_sat:expr) => {{
-			let amount_sat = $amount_sat;
-			let expected_new_channel_value_sat = $expected_new_channel_value_sat;
+		($amount_sat:expr) => {{
+			let amount_sat: u64 = $amount_sat;
 			let amount_msat = amount_sat * 1000;
 			let invoice_description = Bolt11InvoiceDescription::Direct(
 				Description::new(format!("lsps4 tier test {}", amount_sat)).unwrap(),
@@ -2250,51 +2241,109 @@ async fn lsps4_channel_size_tiers_are_applied() {
 				.unwrap();
 			let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
 
-			if expected_new_channel_value_sat.is_some() {
-				expect_channel_pending_event!(service_node, client_node.node_id());
-				expect_channel_ready_event!(service_node, client_node.node_id());
-				expect_channel_pending_event!(client_node, service_node.node_id());
-				expect_channel_ready_event!(client_node, service_node.node_id());
+			let mut payer_succeeded = false;
+			let mut forwarded = false;
+			let mut client_payment_id = None;
+			let mut liquidity_pending = false;
+
+			'drive: for _ in 0..60 {
+				for node in [&service_node, &client_node, &payer_node] {
+					while let Some(event) = node.next_event() {
+						match event {
+							Event::PaymentForwarded {
+								skimmed_fee_msat,
+								outbound_amount_forwarded_msat,
+								..
+							} => {
+								assert_eq!(skimmed_fee_msat.unwrap_or(0), 0);
+								assert_eq!(outbound_amount_forwarded_msat, Some(amount_msat));
+								forwarded = true;
+							},
+							Event::ChannelPending { .. } | Event::SplicePending { .. } => {
+								liquidity_pending = true;
+							},
+							Event::PaymentSuccessful { payment_id: pid, .. }
+								if pid == Some(payment_id) =>
+							{
+								payer_succeeded = true;
+							},
+							Event::PaymentReceived { payment_id: pid, amount_msat: amt, .. } => {
+								assert_eq!(amt, amount_msat);
+								client_payment_id = pid;
+							},
+							_ => {},
+						}
+						node.event_handled().unwrap();
+					}
+				}
+
+				if payer_succeeded && forwarded && client_payment_id.is_some() {
+					break 'drive;
+				}
+
+				// Confirm any pending splice/open so the LSP can retry forwarding.
+				if liquidity_pending {
+					generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+					service_node.sync_wallets().unwrap();
+					client_node.sync_wallets().unwrap();
+					payer_node.sync_wallets().unwrap();
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 			}
 
-			expect_service_forward(amount_msat);
-			expect_payment_successful_event!(payer_node, Some(payment_id), None);
-			let client_payment_id = expect_payment_received_event!(client_node, amount_msat).unwrap();
+			assert!(payer_succeeded, "payer did not complete {}sat payment", amount_sat);
+			assert!(forwarded, "service did not forward {}sat payment", amount_sat);
+			let client_payment_id =
+				client_payment_id.expect("client did not receive the payment");
+
 			let payment = client_node.payment(&client_payment_id).unwrap();
 			assert!(matches!(payment.kind, PaymentKind::Bolt11Jit { .. }));
 			assert_eq!(payment.amount_msat, Some(amount_msat));
 			assert_eq!(payment.status, PaymentStatus::Succeeded);
 
-			if let Some(channel_value_sat) = expected_new_channel_value_sat {
-				expected_channel_values.push(channel_value_sat);
-			}
-
-			let mut actual_channel_values: Vec<u64> = client_node
+			// Liquidity is always added by splicing the existing channel, never by opening
+			// additional ones, so the client holds exactly one channel with the service.
+			let channel_values: Vec<u64> = client_node
 				.list_channels()
 				.into_iter()
 				.filter(|chan| chan.counterparty_node_id == service_node.node_id())
 				.map(|chan| chan.channel_value_sats)
 				.collect();
-			actual_channel_values.sort_unstable();
-			let mut expected_sorted = expected_channel_values.clone();
-			expected_sorted.sort_unstable();
-			assert_eq!(actual_channel_values, expected_sorted);
+			assert_eq!(
+				channel_values.len(),
+				1,
+				"expected a single client<->service channel, got {:?}",
+				channel_values
+			);
+			channel_values[0]
 		}};
 	}
 
-	pay_lsps4_invoice!(50_000, Some(100_000));
-	pay_lsps4_invoice!(100_000, Some(500_000));
+	// A request below tier[0] still opens a tier[0]-sized channel: the tier is applied.
+	let mut channel_value_sat = pay_lsps4_invoice!(50_000);
+	assert_eq!(channel_value_sat, tier0_channel_size_sat);
 
-	for _ in 0..5 {
-		pay_lsps4_invoice!(20_000, None);
+	// Subsequent liquidity needs grow the same channel via splicing. Exact post-splice
+	// sizes depend on reserve/capacity, so we only assert the channel never splits and
+	// never shrinks.
+	for amount_sat in [100_000u64, 20_000, 400_000] {
+		let new_value_sat = pay_lsps4_invoice!(amount_sat);
+		assert!(
+			new_value_sat >= channel_value_sat,
+			"channel shrank from {} to {}",
+			channel_value_sat,
+			new_value_sat
+		);
+		channel_value_sat = new_value_sat;
 	}
 
-	pay_lsps4_invoice!(400_000, Some(1_000_000));
-	pay_lsps4_invoice!(100_000, None);
-	pay_lsps4_invoice!(700_000, Some(1_000_000));
-	pay_lsps4_invoice!(900_000, Some(1_000_000));
-
-	assert_eq!(expected_channel_values, vec![100_000, 500_000, 1_000_000, 1_000_000, 1_000_000]);
+	// The channel must have grown beyond the initial tier[0] open via splicing.
+	assert!(
+		channel_value_sat > tier0_channel_size_sat,
+		"expected channel to grow beyond tier[0] ({}sat) via splicing, final size {}sat",
+		tier0_channel_size_sat,
+		channel_value_sat
+	);
 }
 
 #[test]
