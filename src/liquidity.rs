@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::{PublicKey, Secp256k1};
+use bitcoin::secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey};
 use bitcoin::Transaction;
 use chrono::Utc;
 use lightning::events::HTLCHandlingFailureType;
@@ -155,6 +155,7 @@ struct LSPS4Client {
 	lsp_node_id: PublicKey,
 	lsp_address: SocketAddress,
 	ldk_client_config: LdkLSPS4ClientConfig,
+	fee_claim: Option<String>,
 	pending_register_node_requests:
 		Mutex<HashMap<LSPSRequestId, oneshot::Sender<LSPS4RegisterNodeResponse>>>,
 }
@@ -163,6 +164,9 @@ struct LSPS4Client {
 pub(crate) struct LSPS4ClientConfig {
 	pub node_id: PublicKey,
 	pub address: SocketAddress,
+	/// Opaque lowercase-hex signed grant presented on `register_node`; the LSP verifies it against
+	/// its configured issuer keys. `None` leaves the node on the standard fee policy.
+	pub fee_claim: Option<String>,
 }
 struct LSPS4Service {
 	service_config: LSPS4ServiceConfig,
@@ -189,6 +193,10 @@ pub struct LSPS4ServiceConfig {
 	/// channels with the peer. The first entry applies when there are no channels, the second
 	/// when there is already one, and so on. If empty, no tiering is applied.
 	pub channel_size_tiers: Vec<u64>,
+	/// X-only public keys whose signatures grant a non-standard fee policy. A `register_node`
+	/// fee claim is honoured only if it verifies against one of these keys. Empty means no claim
+	/// is ever honoured and every peer stays on the standard policy.
+	pub issuer_pubkeys: Vec<XOnlyPublicKey>,
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
@@ -284,7 +292,7 @@ where
 	}
 
 	pub(crate) fn lsps4_client(
-		&mut self, lsp_node_id: PublicKey, lsp_address: SocketAddress,
+		&mut self, lsp_node_id: PublicKey, lsp_address: SocketAddress, fee_claim: Option<String>,
 	) -> &mut Self {
 		let ldk_client_config = LdkLSPS4ClientConfig {};
 		let pending_register_node_requests = Mutex::new(HashMap::new());
@@ -292,6 +300,7 @@ where
 			lsp_node_id,
 			lsp_address,
 			ldk_client_config,
+			fee_claim,
 			pending_register_node_requests,
 		});
 		self
@@ -306,12 +315,12 @@ where
 	}
 
 	pub(crate) fn lsps4_service(&mut self, service_config: LSPS4ServiceConfig) -> &mut Self {
-		let ldk_service_config =
-			LdkLSPS4ServiceConfig { 
-				cltv_expiry_delta: LSPS2_CHANNEL_CLTV_EXPIRY_DELTA,
-				forwarding_fee_proportional_millionths: service_config
+		let ldk_service_config = LdkLSPS4ServiceConfig {
+			cltv_expiry_delta: LSPS2_CHANNEL_CLTV_EXPIRY_DELTA,
+			forwarding_fee_proportional_millionths: service_config
 				.forwarding_fee_proportional_millionths,
-			};
+			issuer_pubkeys: service_config.issuer_pubkeys.clone(),
+		};
 		self.lsps4_service = Some(LSPS4Service { service_config, ldk_service_config });
 		self
 	}
@@ -1684,7 +1693,9 @@ where
 		{
 			let mut pending_register_node_requests_lock =
 				lsps4_client.pending_register_node_requests.lock().unwrap();
-			let request_id = client_handler.register_node(lsps4_client.lsp_node_id).unwrap();
+			let request_id = client_handler
+				.register_node(lsps4_client.lsp_node_id, lsps4_client.fee_claim.clone())
+				.unwrap();
 			pending_register_node_requests_lock.insert(request_id, register_node_sender);
 		}
 		log_info!(self.logger, "TIMING: lsps4_register_node() sent request, waiting for response...");
