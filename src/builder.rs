@@ -489,14 +489,14 @@ impl NodeBuilder {
 	///
 	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
 	pub fn set_liquidity_source_lsps4(
-		&mut self, node_id: PublicKey, address: SocketAddress,
+		&mut self, node_id: PublicKey, address: SocketAddress, fee_claim: Option<String>,
 	) -> &mut Self {
 		// Mark the LSP as trusted for 0conf
 		self.config.trusted_peers_0conf.push(node_id.clone());
 
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
-		let lsps4_client_config = LSPS4ClientConfig { node_id, address };
+		let lsps4_client_config = LSPS4ClientConfig { node_id, address, fee_claim };
 		liquidity_source_config.lsps4_client = Some(lsps4_client_config);
 		self
 	}
@@ -1873,7 +1873,11 @@ fn build_with_store_internal(
 			});
 
 			lsc.lsps4_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps4_client(config.node_id, config.address.clone())
+				liquidity_source_builder.lsps4_client(
+					config.node_id,
+					config.address.clone(),
+					config.fee_claim.clone(),
+				)
 			});
 
 			let promise_secret = {
@@ -2152,7 +2156,34 @@ pub(crate) fn sanitize_alias(alias_str: &str) -> Result<NodeAlias, BuildError> {
 
 #[cfg(test)]
 mod tests {
-	use super::{sanitize_alias, BuildError, NodeAlias};
+	use super::{sanitize_alias, BuildError, NodeAlias, NodeBuilder};
+	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+	use lightning::ln::msgs::SocketAddress;
+
+	fn dummy_lsp() -> (PublicKey, SocketAddress) {
+		let node_id =
+			PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[1u8; 32]).unwrap());
+		let address = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 9735 };
+		(node_id, address)
+	}
+
+	#[test]
+	fn lsps4_source_stores_the_fee_claim() {
+		let (node_id, address) = dummy_lsp();
+		let mut builder = NodeBuilder::new();
+		builder.set_liquidity_source_lsps4(node_id, address, Some("deadbeef".to_string()));
+		let config = builder.liquidity_source_config.unwrap().lsps4_client.unwrap();
+		assert_eq!(config.fee_claim, Some("deadbeef".to_string()));
+	}
+
+	#[test]
+	fn lsps4_source_without_a_claim_stores_none() {
+		let (node_id, address) = dummy_lsp();
+		let mut builder = NodeBuilder::new();
+		builder.set_liquidity_source_lsps4(node_id, address, None);
+		let config = builder.liquidity_source_config.unwrap().lsps4_client.unwrap();
+		assert_eq!(config.fee_claim, None);
+	}
 
 	#[test]
 	fn sanitize_empty_node_alias() {
