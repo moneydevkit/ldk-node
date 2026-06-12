@@ -18,8 +18,6 @@ use bip21::de::ParamKind;
 use bip21::{DeserializationError, DeserializeParams, Param, SerializeParams};
 use bitcoin::address::{NetworkChecked, NetworkUnchecked};
 use bitcoin::{Amount, Txid};
-use bitcoin_payment_instructions::amount::Amount as BPIAmount;
-use bitcoin_payment_instructions::{PaymentInstructions, PaymentMethod};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::offers::offer::Offer;
 use lightning::routing::router::RouteParametersConfig;

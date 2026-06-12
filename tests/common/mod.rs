@@ -17,7 +17,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256::Hash as Sha256;
@@ -204,7 +204,47 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 	electrsd_conf.http_enabled = true;
 	electrsd_conf.network = "regtest";
 	let electrsd = ElectrsD::with_conf(electrs_exe, &bitcoind, &electrsd_conf).unwrap();
+	wait_for_esplora_ready(&electrsd);
 	(bitcoind, electrsd)
+}
+
+/// Block until electrs's esplora REST endpoint is actually serving requests.
+///
+/// `ElectrsD::with_conf` returns as soon as the electrum RPC port is listening, but the esplora
+/// HTTP server may not be accepting connections yet. Hitting it before it is ready surfaces as a
+/// transient fee-estimate fetch failure during `Node::start`. Failing fast there is the right
+/// behavior for production, where a real esplora is expected to already be up, so we keep the node
+/// strict and instead make the test harness hand back a backend that is ready to serve.
+fn wait_for_esplora_ready(electrsd: &ElectrsD) {
+	use std::io::{Read, Write};
+	use std::net::TcpStream;
+
+	let addr = electrsd.esplora_url.as_ref().expect("esplora REST endpoint not enabled");
+	let deadline = Instant::now() + Duration::from_secs(30);
+	loop {
+		let responded = TcpStream::connect(addr)
+			.ok()
+			.and_then(|mut stream| {
+				stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+				let request = format!(
+					"GET /blocks/tip/height HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+				);
+				stream.write_all(request.as_bytes()).ok()?;
+				let mut response = String::new();
+				stream.read_to_string(&mut response).ok()?;
+				response.lines().next().map(|status| status.contains("200"))
+			})
+			.unwrap_or(false);
+
+		if responded {
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"esplora REST server at {addr} did not become ready in time"
+		);
+		std::thread::sleep(Duration::from_millis(50));
+	}
 }
 
 pub(crate) fn random_storage_path() -> PathBuf {
