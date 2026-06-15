@@ -78,7 +78,14 @@ pub(crate) const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
 pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20;
 
 // The timeout after which we abort a wallet syncing operation.
-pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 10;
+// Raised from the stock 10s: against a remote, rate-limited Esplora the
+// per-monitor tx_sync fans out ~60 HTTP calls and realistically takes ~20s
+// even with the parallel (buffer_unordered) client. 10s guaranteed a
+// TxSyncTimeout -> NAPI panic on any wallet with real channel history.
+// 90s leaves headroom for watch-set growth while still failing fast if
+// Esplora is genuinely dead (a webhook node only lives ~40-60s). Lower this
+// back toward ~30s once Esplora sits behind a cache/CDN.
+pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 90;
 
 // The timeout after which we give up waiting on LDK's event handler to exit on shutdown.
 pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
