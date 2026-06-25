@@ -142,6 +142,7 @@ use lightning::ln::channel_state::{ChannelDetails as LdkChannelDetails, ChannelS
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::funding::SpliceContribution;
 use lightning::ln::msgs::SocketAddress;
+use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeAlias;
 use lightning::util::persist::KVStoreSync;
 use lightning_background_processor::process_events_async;
@@ -1557,8 +1558,50 @@ impl Node {
 		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason)
 	}
 
+	/// Close a previously opened channel, identified by its [`ChannelId`].
+	///
+	/// Unlike [`Node::close_channel`], which resolves the channel by its
+	/// [`UserChannelId`], this targets the channel directly by its unique
+	/// [`ChannelId`]. Prefer this whenever a counterparty may hold multiple
+	/// channels that share a `user_channel_id` (e.g. LSP-opened channels all
+	/// assigned `user_channel_id = 0`), where resolving by `user_channel_id`
+	/// would close an arbitrary one of them.
+	pub fn close_channel_by_id(
+		&self, channel_id: &ChannelId, counterparty_node_id: PublicKey,
+	) -> Result<(), Error> {
+		self.close_channel_by_id_internal(channel_id, counterparty_node_id, false, None)
+	}
+
+	/// Force-close a previously opened channel, identified by its [`ChannelId`].
+	///
+	/// Behaves like [`Node::force_close_channel`] but targets the channel
+	/// directly by its unique [`ChannelId`] rather than resolving it by
+	/// [`UserChannelId`]. See [`Node::close_channel_by_id`] for why this matters.
+	pub fn force_close_channel_by_id(
+		&self, channel_id: &ChannelId, counterparty_node_id: PublicKey, reason: Option<String>,
+	) -> Result<(), Error> {
+		self.close_channel_by_id_internal(channel_id, counterparty_node_id, true, reason)
+	}
+
 	fn close_channel_internal(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
+		force_close_reason: Option<String>,
+	) -> Result<(), Error> {
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		match open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0) {
+			Some(channel) => self.close_channel_by_id_internal(
+				&channel.channel_id,
+				counterparty_node_id,
+				force,
+				force_close_reason,
+			),
+			None => Ok(()),
+		}
+	}
+
+	fn close_channel_by_id_internal(
+		&self, channel_id: &ChannelId, counterparty_node_id: PublicKey, force: bool,
 		force_close_reason: Option<String>,
 	) -> Result<(), Error> {
 		debug_assert!(
@@ -1567,13 +1610,11 @@ impl Node {
 		);
 		let open_channels: Vec<LdkChannelDetails> =
 			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
-		if let Some(channel_details) =
-			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
-		{
+		if open_channels.iter().any(|c| &c.channel_id == channel_id) {
 			if force {
 				self.channel_manager
 					.force_close_broadcasting_latest_txn(
-						&channel_details.channel_id,
+						channel_id,
 						&counterparty_node_id,
 						force_close_reason.unwrap_or_default(),
 					)
@@ -1582,12 +1623,12 @@ impl Node {
 						Error::ChannelClosingFailed
 					})?;
 			} else {
-				self.channel_manager
-					.close_channel(&channel_details.channel_id, &counterparty_node_id)
-					.map_err(|e| {
+				self.channel_manager.close_channel(channel_id, &counterparty_node_id).map_err(
+					|e| {
 						log_error!(self.logger, "Failed to close channel: {:?}", e);
 						Error::ChannelClosingFailed
-					})?;
+					},
+				)?;
 			}
 
 			// Check if this was the last open channel, if so, forget the peer.
