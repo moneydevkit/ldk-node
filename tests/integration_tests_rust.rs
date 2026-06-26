@@ -2019,6 +2019,7 @@ async fn lsps4_client_service_integration() {
 		channel_over_provisioning_ppm,
 		forwarding_fee_proportional_millionths: forwarding_fee_ppm,
 		channel_size_tiers: vec![],
+		issuer_pubkeys: vec![],
 	};
 
 	let service_config = random_config(true);
@@ -2034,7 +2035,7 @@ async fn lsps4_client_service_integration() {
 	let client_config = random_config(true);
 	setup_builder!(client_builder, client_config.node_config);
 	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
-	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr);
+	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr, None);
 	let client_node = client_builder.build().unwrap();
 	client_node.start().unwrap();
 
@@ -2169,6 +2170,7 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 		channel_over_provisioning_ppm: 0,
 		forwarding_fee_proportional_millionths: forwarding_fee_ppm,
 		channel_size_tiers: vec![100_000, 500_000, 1_000_000],
+		issuer_pubkeys: vec![],
 	};
 
 	let service_config = random_config(true);
@@ -2184,7 +2186,7 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 	let client_config = random_config(true);
 	setup_builder!(client_builder, client_config.node_config);
 	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
-	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr);
+	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr, None);
 	let client_node = client_builder.build().unwrap();
 	client_node.start().unwrap();
 
