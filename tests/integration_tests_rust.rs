@@ -207,6 +207,201 @@ async fn zero_conf_channel_funding_tx_no_double_spend() {
 	node_c.stop().unwrap();
 }
 
+// Regression test for the splice double-spend race. `select_confirmed_utxos` now
+// records the coins a splice selects in the wallet's in-memory reserved set, which every
+// selection path excludes, so a concurrent funding build cannot reselect them. Unlike a channel
+// open, a splice signs its funding tx later (in a detached FundingTransactionReadyForSigning
+// event), so the coins must stay live in the BDK graph rather than be marked spent at selection.
+// Splices previously reserved nothing — their `cancel_tx` rollback passed a tx with an empty
+// input list, a no-op — so a competing build could reselect and double-spend the same coin.
+//
+// This mirrors `zero_conf_channel_funding_tx_no_double_spend`: rather than race two threads, it
+// gives node A a single confirmed coin, drives the splice, then without a sync asserts the coin
+// is no longer spendable and a competing open is rejected with `InsufficientFunds`. The
+// reservation is taken synchronously before `splice_in` returns, so the serialized second build
+// sees it — the same outcome a truly concurrent build would get from the reservation lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_funding_tx_no_double_spend() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	println!("== Node A ==");
+	let config_a = random_config(false);
+	let node_a = setup_node(&chain_source, config_a, None);
+
+	println!("\n== Node B ==");
+	let config_b = random_config(false);
+	let node_b = setup_node(&chain_source, config_b, None);
+
+	println!("\n== Node C ==");
+	let config_c = random_config(false);
+	let node_c = setup_node(&chain_source, config_c, None);
+
+	// Give A and B a single confirmed UTXO each.
+	let premine_amount_sat = 1_000_000;
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Open and confirm a channel A -> B. A's on-chain change confirms into a single UTXO that the
+	// later splice must spend.
+	let channel_amount_sat = 200_000;
+	println!("\nA -- open_channel -> B");
+	node_a
+		.open_channel(
+			node_b.node_id(),
+			node_b.listening_addresses().unwrap().first().unwrap().clone(),
+			channel_amount_sat,
+			None,
+			None,
+		)
+		.unwrap();
+	let funding_txo = expect_channel_pending_event!(node_a, node_b.node_id());
+	expect_channel_pending_event!(node_b, node_a.node_id());
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// A's only confirmed coin is now the change from the open; any funding build must spend it.
+	assert!(node_a.list_balances().spendable_onchain_balance_sats > channel_amount_sat);
+
+	// Splice that confirmed coin into the A -> B channel. Selection reserves it before `splice_in`
+	// returns.
+	let splice_amount_sat = 600_000;
+	println!("\nA -- splice_in -> B");
+	node_a.splice_in(&user_channel_id_a, node_b.node_id(), splice_amount_sat).unwrap();
+
+	// WITHOUT a sync: the coin stays live in the wallet graph (a splice signs later, so it must not
+	// be marked spent), but get_balances discounts the reserved value, so spendable drops below
+	// splice_amount. Pre-fix this still read the full confirmed balance.
+	assert!(
+		node_a.list_balances().spendable_onchain_balance_sats < splice_amount_sat,
+		"splice inputs were not reserved at selection time"
+	);
+
+	// A competing open to C would double-spend the reserved coin. With it reserved the open is
+	// rejected up front instead of silently building a conflicting funding tx.
+	println!("\nA -- open_channel -> C");
+	assert_eq!(
+		Err(NodeError::InsufficientFunds),
+		node_a.open_channel(
+			node_c.node_id(),
+			node_c.listening_addresses().unwrap().first().unwrap().clone(),
+			splice_amount_sat,
+			None,
+			None,
+		)
+	);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+	node_c.stop().unwrap();
+}
+
+// Companion to `splice_funding_tx_no_double_spend`: when a splice fails before reaching LDK, the
+// coins it reserved at selection must be freed again. A second `splice_in` on a channel that
+// already has a splice pending selects and reserves a coin, then `channel_manager.splice_channel`
+// rejects it ("already a splice pending") and `splice_in` runs `release_reserved_utxos`. The freed
+// coin must be spendable and reusable afterwards; if release were broken it would stay stranded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_failure_releases_reserved_utxos() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	println!("== Node A ==");
+	let config_a = random_config(false);
+	let node_a = setup_node(&chain_source, config_a, None);
+
+	println!("\n== Node B ==");
+	let config_b = random_config(false);
+	let node_b = setup_node(&chain_source, config_b, None);
+
+	println!("\n== Node C ==");
+	let config_c = random_config(false);
+	let node_c = setup_node(&chain_source, config_c, None);
+
+	// Give A two confirmed UTXOs so a splice can reserve one and still leave a coin to select.
+	let premine_amount_sat = 1_000_000;
+	let addr_a1 = node_a.onchain_payment().new_address().unwrap();
+	let addr_a2 = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a1, addr_a2],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+
+	// Open and confirm a channel A -> B to splice into. The funding tx spends one coin; A is left
+	// with that coin's change plus the untouched second coin, i.e. two confirmed coins.
+	let channel_amount_sat = 200_000;
+	println!("\nA -- open_channel -> B");
+	node_a
+		.open_channel(
+			node_b.node_id(),
+			node_b.listening_addresses().unwrap().first().unwrap().clone(),
+			channel_amount_sat,
+			None,
+			None,
+		)
+		.unwrap();
+	let funding_txo = expect_channel_pending_event!(node_a, node_b.node_id());
+	expect_channel_pending_event!(node_b, node_a.node_id());
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// First splice succeeds and stays pending; it reserves one coin, leaving the other free.
+	let first_splice_sat = 600_000;
+	println!("\nA -- splice_in -> B (succeeds, stays pending)");
+	node_a.splice_in(&user_channel_id_a, node_b.node_id(), first_splice_sat).unwrap();
+
+	// Second splice on the same channel: selection reserves the remaining coin, then
+	// `splice_channel` rejects it because a splice is already pending, so `splice_in` errors and
+	// must release the just-reserved coin.
+	let second_splice_sat = 100_000;
+	println!("\nA -- splice_in -> B (rejected: splice already pending)");
+	assert!(
+		node_a.splice_in(&user_channel_id_a, node_b.node_id(), second_splice_sat).is_err(),
+		"a second splice on a channel with one pending must be rejected"
+	);
+
+	// The coin the failed splice reserved is free again: a fresh channel open to C can spend it.
+	// If release were broken both coins would be reserved and this would fail with InsufficientFunds.
+	println!("\nA -- open_channel -> C (spends the released coin)");
+	assert!(
+		node_a
+			.open_channel(
+				node_c.node_id(),
+				node_c.listening_addresses().unwrap().first().unwrap().clone(),
+				500_000,
+				None,
+				None,
+			)
+			.is_ok(),
+		"the coin reserved by the failed splice was not released"
+	);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+	node_c.stop().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn channel_open_fails_when_funds_insufficient() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();

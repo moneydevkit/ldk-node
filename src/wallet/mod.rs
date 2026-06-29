@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -27,7 +28,7 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::{
-	Address, Amount, FeeRate, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, Weight,
+	Address, Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, Weight,
 	WitnessProgram, WitnessVersion,
 };
 use lightning::chain::chaininterface::BroadcasterInterface;
@@ -67,6 +68,7 @@ pub(crate) struct Wallet {
 	// A BDK on-chain wallet.
 	inner: Mutex<PersistedWallet<KVStoreWalletPersister>>,
 	persister: Mutex<KVStoreWalletPersister>,
+	reserved_utxos: Mutex<HashSet<OutPoint>>,
 	broadcaster: Arc<Broadcaster>,
 	fee_estimator: Arc<OnchainFeeEstimator>,
 	payment_store: Arc<PaymentStore>,
@@ -83,7 +85,22 @@ impl Wallet {
 	) -> Self {
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
-		Self { inner, persister, broadcaster, fee_estimator, payment_store, config, logger }
+		let reserved_utxos = Mutex::new(HashSet::new());
+		Self {
+			inner,
+			persister,
+			reserved_utxos,
+			broadcaster,
+			fee_estimator,
+			payment_store,
+			config,
+			logger,
+		}
+	}
+
+	// Snapshot the coins reserved for in-flight splices, for exclusion from coin selection.
+	fn reserved_outpoints(&self) -> Vec<OutPoint> {
+		self.reserved_utxos.lock().unwrap().iter().copied().collect()
 	}
 
 	pub(crate) fn get_full_scan_request(&self) -> FullScanRequest<KeychainKind> {
@@ -234,10 +251,15 @@ impl Wallet {
 	) -> Result<Transaction, Error> {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
 
+		let reserved = self.reserved_outpoints();
 		let mut locked_wallet = self.inner.lock().unwrap();
 		let mut tx_builder = locked_wallet.build_tx();
 
-		tx_builder.add_recipient(output_script, amount).fee_rate(fee_rate).nlocktime(locktime);
+		tx_builder
+			.add_recipient(output_script, amount)
+			.fee_rate(fee_rate)
+			.nlocktime(locktime)
+			.unspendable(reserved);
 
 		let mut psbt = match tx_builder.finish() {
 			Ok(psbt) => {
@@ -326,19 +348,37 @@ impl Wallet {
 	pub(crate) fn get_balances(
 		&self, total_anchor_channels_reserve_sats: u64,
 	) -> Result<(u64, u64), Error> {
+		// Reserved coins are still owned (kept in `total`) but not spendable: discount them from
+		// `spendable` and from the Anchor-availability assert below.
+		let reserved_sat = self.reserved_confirmed_sat();
 		let balance = self.inner.lock().unwrap().balance();
 
 		// Make sure `list_confirmed_utxos` returns at least one `Utxo` we could use to spend/bump
-		// Anchors if we have any confirmed amounts.
+		// Anchors if we have any confirmed amounts left after reservations.
 		#[cfg(debug_assertions)]
-		if balance.confirmed != Amount::ZERO {
+		if balance.confirmed.to_sat() > reserved_sat {
 			debug_assert!(
 				self.list_confirmed_utxos_inner().map_or(false, |v| !v.is_empty()),
 				"Confirmed amounts should always be available for Anchor spending"
 			);
 		}
 
-		self.get_balances_inner(balance, total_anchor_channels_reserve_sats)
+		let (total, spendable) =
+			self.get_balances_inner(balance, total_anchor_channels_reserve_sats)?;
+		Ok((total, spendable.saturating_sub(reserved_sat)))
+	}
+
+	// Total value of coins currently reserved for in-flight splices. Splices only reserve confirmed
+	// coins, so this is the confirmed amount that is no longer spendable.
+	fn reserved_confirmed_sat(&self) -> u64 {
+		// Snapshot and drop the reserved lock before taking the wallet lock: the two never overlap.
+		let reserved = self.reserved_outpoints();
+		let locked_wallet = self.inner.lock().unwrap();
+		reserved
+			.iter()
+			.filter_map(|outpoint| locked_wallet.get_utxo(*outpoint))
+			.map(|utxo| utxo.txout.value.to_sat())
+			.sum()
 	}
 
 	fn get_balances_inner(
@@ -377,12 +417,15 @@ impl Wallet {
 		let fee_rate =
 			fee_rate.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(confirmation_target));
 
+		// Exclude coins reserved for an in-flight splice.
+		let reserved = self.reserved_outpoints();
+
 		let tx = {
 			let mut locked_wallet = self.inner.lock().unwrap();
 
 			// Prepare the tx_builder. We properly check the reserve requirements (again) further down.
 			const DUST_LIMIT_SATS: u64 = 546;
-			let tx_builder = match send_amount {
+			let mut tx_builder = match send_amount {
 				OnchainSendAmount::ExactRetainingReserve { amount_sats, .. } => {
 					let mut tx_builder = locked_wallet.build_tx();
 					let amount = Amount::from_sat(amount_sats);
@@ -407,7 +450,8 @@ impl Wallet {
 								change_address_info.address.script_pubkey(),
 								Amount::from_sat(cur_anchor_reserve_sats),
 							)
-							.fee_rate(fee_rate);
+							.fee_rate(fee_rate)
+							.unspendable(reserved.clone());
 						match tmp_tx_builder.finish() {
 							Ok(psbt) => psbt.unsigned_tx,
 							Err(err) => {
@@ -459,6 +503,8 @@ impl Wallet {
 					tx_builder
 				},
 			};
+
+			tx_builder.unspendable(reserved);
 
 			let mut psbt = match tx_builder.finish() {
 				Ok(psbt) => {
@@ -585,20 +631,16 @@ impl Wallet {
 
 	pub(crate) fn select_confirmed_utxos(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
-	) -> Result<Vec<FundingTxInput>, ()> {
-		self.select_utxos_inner(must_spend, must_pay_to, fee_rate, true)
+	) -> Result<(Vec<FundingTxInput>, Vec<OutPoint>), ()> {
+		self.select_utxos_inner(must_spend, must_pay_to, fee_rate)
 	}
 
-	pub(crate) fn select_utxos(
-		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
-	) -> Result<Vec<FundingTxInput>, ()> {
-		self.select_utxos_inner(must_spend, must_pay_to, fee_rate, false)
-	}
-
+	// Select coins to fund a splice, add them to `reserved_utxos`, and return their outpoints so the
+	// caller can release them on `finalize_splice` (signed) or `abort_splice` (failed).
 	fn select_utxos_inner(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
-		confirmed_only: bool,
-	) -> Result<Vec<FundingTxInput>, ()> {
+	) -> Result<(Vec<FundingTxInput>, Vec<OutPoint>), ()> {
+		let reserved = self.reserved_outpoints();
 		let mut locked_wallet = self.inner.lock().unwrap();
 		debug_assert!(matches!(
 			locked_wallet.public_descriptor(KeychainKind::External),
@@ -626,29 +668,114 @@ impl Wallet {
 		}
 
 		tx_builder.fee_rate(fee_rate);
-		if confirmed_only {
-			tx_builder.exclude_unconfirmed();
-		}
+		tx_builder.unspendable(reserved);
+		tx_builder.exclude_unconfirmed();
 
-		tx_builder
+		let selection_tx = tx_builder
 			.finish()
 			.map_err(|e| {
 				log_error!(self.logger, "Failed to select UTXOs: {}", e);
 			})?
-			.unsigned_tx
+			.unsigned_tx;
+
+		// The wallet coins selected to fund the splice (everything but the shared channel input).
+		let selected_outpoints: Vec<OutPoint> = selection_tx
 			.input
 			.iter()
-			.filter(|txin| must_spend.iter().all(|input| input.outpoint != txin.previous_output))
-			.filter_map(|txin| {
-				locked_wallet
-					.tx_details(txin.previous_output.txid)
-					.map(|tx_details| tx_details.tx.deref().clone())
-					.map(|prevtx| FundingTxInput::new_p2wpkh(prevtx, txin.previous_output.vout))
+			.map(|txin| txin.previous_output)
+			.filter(|outpoint| must_spend.iter().all(|input| input.outpoint != *outpoint))
+			.collect();
+
+		let inputs = selected_outpoints
+			.iter()
+			.map(|outpoint| match locked_wallet.tx_details(outpoint.txid) {
+				Some(tx_details) => {
+					log_debug!(
+						self.logger,
+						"Selected UTXO {} (confirmed: {})",
+						outpoint,
+						tx_details.chain_position.is_confirmed()
+					);
+					let prevtx = tx_details.tx.deref().clone();
+					FundingTxInput::new_p2wpkh(prevtx, outpoint.vout)
+				},
+				None => {
+					log_error!(
+						self.logger,
+						"Selected UTXO {} dropped: no wallet tx details (parent likely evicted)",
+						outpoint
+					);
+					Err(())
+				},
 			})
-			.collect::<Result<Vec<_>, ()>>()
+			.collect::<Result<Vec<_>, ()>>()?;
+
+		// Drop the wallet lock before taking the reservation lock: the two never overlap.
+		drop(locked_wallet);
+
+		self.reserved_utxos.lock().unwrap().extend(selected_outpoints.iter().copied());
+
+		Ok((inputs, selected_outpoints))
+	}
+
+	// Drop a splice reservation, freeing the coins for reuse. Used when the splice fails before its
+	// funding tx is on chain.
+	pub(crate) fn release_reserved_utxos(&self, outpoints: &[OutPoint]) {
+		let mut reserved = self.reserved_utxos.lock().unwrap();
+		for outpoint in outpoints {
+			reserved.remove(outpoint);
+		}
+	}
+
+	// Commit a signed splice funding tx: record it as unconfirmed so the wallet graph marks the
+	// coins spent (closing the double-spend window until the next sync), then drop their reservation.
+	pub(crate) fn finalize_splice(&self, funding_tx: Transaction) -> Result<(), Error> {
+		let outpoints = self.reserved_inputs_of(&funding_tx);
+		if outpoints.is_empty() {
+			return Ok(());
+		}
+
+		let persist_result = {
+			let mut locked_wallet = self.inner.lock().unwrap();
+			let mut locked_persister = self.persister.lock().unwrap();
+
+			let last_seen =
+				SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
+			locked_wallet.apply_unconfirmed_txs([(funding_tx, last_seen)]);
+			locked_wallet.persist(&mut locked_persister).map(|_| ()).map_err(|e| {
+				log_error!(self.logger, "Failed to persist wallet: {}", e);
+				Error::PersistenceFailed
+			})
+		};
+
+		// Release even if persist failed: the in-memory graph already marks the coins spent, so
+		// double-spend protection holds and keeping the reservation would only strand the balance.
+		self.release_reserved_utxos(&outpoints);
+
+		persist_result
+	}
+
+	// Free the coins a failed splice reserved, recovered by intersecting the tx's inputs with the
+	// reservation set (the signing event hands back the tx, not the original selection).
+	pub(crate) fn abort_splice(&self, tx: &Transaction) {
+		let outpoints = self.reserved_inputs_of(tx);
+		self.release_reserved_utxos(&outpoints);
+	}
+
+	// The tx inputs currently reserved for an in-flight splice.
+	fn reserved_inputs_of(&self, tx: &Transaction) -> Vec<OutPoint> {
+		let reserved = self.reserved_utxos.lock().unwrap();
+		tx.input
+			.iter()
+			.map(|txin| txin.previous_output)
+			.filter(|outpoint| reserved.contains(outpoint))
+			.collect()
 	}
 
 	fn list_confirmed_utxos_inner(&self) -> Result<Vec<Utxo>, ()> {
+		// Snapshot and drop the reserved lock before taking the wallet lock: the two never overlap.
+		let reserved: HashSet<OutPoint> =
+			self.reserved_utxos.lock().unwrap().iter().copied().collect();
 		let locked_wallet = self.inner.lock().unwrap();
 		let mut utxos = Vec::new();
 		let confirmed_txs: Vec<Txid> = locked_wallet
@@ -656,8 +783,10 @@ impl Wallet {
 			.filter(|t| t.chain_position.is_confirmed())
 			.map(|t| t.tx_node.txid)
 			.collect();
-		let unspent_confirmed_utxos =
-			locked_wallet.list_unspent().filter(|u| confirmed_txs.contains(&u.outpoint.txid));
+		// Skip coins reserved for an in-flight splice.
+		let unspent_confirmed_utxos = locked_wallet.list_unspent().filter(|u| {
+			confirmed_txs.contains(&u.outpoint.txid) && !reserved.contains(&u.outpoint)
+		});
 
 		for u in unspent_confirmed_utxos {
 			let script_pubkey = u.txout.script_pubkey;

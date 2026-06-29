@@ -1338,7 +1338,7 @@ impl Node {
 
 			let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
 
-			let inputs = self
+			let (inputs, reserved_outpoints) = self
 				.wallet
 				.select_confirmed_utxos(vec![shared_input], &[shared_output], fee_rate)
 				.map_err(|()| {
@@ -1365,30 +1365,22 @@ impl Node {
 				},
 			};
 
-			self.channel_manager
-				.splice_channel(
-					&channel_details.channel_id,
-					&counterparty_node_id,
-					contribution,
-					funding_feerate_per_kw,
-					None,
-				)
-				.map_err(|e| {
+			match self.channel_manager.splice_channel(
+				&channel_details.channel_id,
+				&counterparty_node_id,
+				contribution,
+				funding_feerate_per_kw,
+				None,
+			) {
+				// Coins stay reserved until the deferred signing step frees them.
+				Ok(()) => Ok(()),
+				Err(e) => {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
-					let tx = bitcoin::Transaction {
-						version: bitcoin::transaction::Version::TWO,
-						lock_time: bitcoin::absolute::LockTime::ZERO,
-						input: vec![],
-						output: vec![bitcoin::TxOut {
-							value: Amount::ZERO,
-							script_pubkey: change_address.script_pubkey(),
-						}],
-					};
-					match self.wallet.cancel_tx(&tx) {
-						Ok(()) => Error::ChannelSplicingFailed,
-						Err(e) => e,
-					}
-				})
+					// The splice never reached LDK; free the reserved coins now.
+					self.wallet.release_reserved_utxos(&reserved_outpoints);
+					Err(Error::ChannelSplicingFailed)
+				},
+			}
 		} else {
 			log_error!(
 				self.logger,
