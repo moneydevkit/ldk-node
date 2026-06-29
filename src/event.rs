@@ -1761,29 +1761,53 @@ where
 				counterparty_node_id,
 				unsigned_transaction,
 				..
-			} => match self.wallet.sign_owned_inputs(unsigned_transaction) {
-				Ok(partially_signed_tx) => {
-					match self.channel_manager.funding_transaction_signed(
-						&channel_id,
-						&counterparty_node_id,
-						partially_signed_tx,
-					) {
-						Ok(()) => {
-							log_info!(
-								self.logger,
-								"Signed funding transaction for channel {} with counterparty {}",
-								channel_id,
-								counterparty_node_id
-							);
-						},
-						Err(e) => {
-							// TODO(splicing): Abort splice once supported in LDK 0.3
-							debug_assert!(false, "Failed signing funding transaction: {:?}", e);
-							log_error!(self.logger, "Failed signing funding transaction: {:?}", e);
-						},
-					}
-				},
-				Err(()) => log_error!(self.logger, "Failed signing funding transaction"),
+			} => {
+				// Keep a copy of the unsigned tx: signing consumes it, but a sign failure still
+				// needs the tx to identify and free the coins this splice reserved.
+				let reserved_tx = unsigned_transaction.clone();
+				match self.wallet.sign_owned_inputs(unsigned_transaction) {
+					Ok(partially_signed_tx) => {
+						let funding_tx = partially_signed_tx.clone();
+						match self.channel_manager.funding_transaction_signed(
+							&channel_id,
+							&counterparty_node_id,
+							partially_signed_tx,
+						) {
+							Ok(()) => {
+								if let Err(e) = self.wallet.finalize_splice(funding_tx) {
+									// The signed tx will be broadcast by LDK but the spend was not
+									// persisted; a restart would see these coins spendable again.
+									log_error!(
+										self.logger,
+										"Failed to record splice funding spend for channel {}: {:?}",
+										channel_id,
+										e
+									);
+								}
+								log_info!(
+									self.logger,
+									"Signed funding transaction for channel {} with counterparty {}",
+									channel_id,
+									counterparty_node_id
+								);
+							},
+							Err(e) => {
+								// TODO(splicing): Abort splice once supported in LDK 0.3
+								self.wallet.abort_splice(&reserved_tx);
+								debug_assert!(false, "Failed signing funding transaction: {:?}", e);
+								log_error!(
+									self.logger,
+									"Failed signing funding transaction: {:?}",
+									e
+								);
+							},
+						}
+					},
+					Err(()) => {
+						self.wallet.abort_splice(&reserved_tx);
+						log_error!(self.logger, "Failed signing funding transaction");
+					},
+				}
 			},
 			LdkEvent::SplicePending {
 				channel_id,

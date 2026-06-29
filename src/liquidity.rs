@@ -2066,9 +2066,9 @@ where
 		let fee_rate =
 			self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
 
-		let inputs = self
+		let (inputs, reserved_outpoints) = self
 			.wallet
-			.select_utxos(vec![shared_input], &[shared_output], fee_rate)
+			.select_confirmed_utxos(vec![shared_input], &[shared_output], fee_rate)
 			.map_err(|()| APIError::APIMisuseError {
 				err: "Insufficient confirmed UTXOs for splice".to_string(),
 			})?;
@@ -2092,28 +2092,21 @@ where
 			},
 		};
 
-		self.channel_manager
-			.splice_channel(
-				&channel_id,
-				&counterparty_node_id,
-				contribution,
-				funding_feerate_per_kw,
-				None,
-			)
-			.map_err(|e| {
-				// Cancel change address reservation on failure
-				let tx = bitcoin::Transaction {
-					version: bitcoin::transaction::Version::TWO,
-					lock_time: bitcoin::absolute::LockTime::ZERO,
-					input: vec![],
-					output: vec![bitcoin::TxOut {
-						value: Amount::ZERO,
-						script_pubkey: change_address.script_pubkey(),
-					}],
-				};
-				let _ = self.wallet.cancel_tx(&tx);
-				e
-			})
+		match self.channel_manager.splice_channel(
+			&channel_id,
+			&counterparty_node_id,
+			contribution,
+			funding_feerate_per_kw,
+			None,
+		) {
+			// Coins stay reserved until the deferred signing step frees them.
+			Ok(()) => Ok(()),
+			Err(e) => {
+				// The splice never reached LDK; free the reserved coins now.
+				self.wallet.release_reserved_utxos(&reserved_outpoints);
+				Err(e)
+			},
+		}
 	}
 
 	/// Open a channel for LSPS4. Extracted from the OpenChannel event handler
