@@ -64,6 +64,13 @@ pub(crate) enum OnchainSendAmount {
 pub(crate) mod persist;
 pub(crate) mod ser;
 
+// Lock ordering: `inner` (wallet) is the OUTER lock, `reserved_utxos` the INNER one. Every
+// selection path reads `reserved_utxos` while holding the wallet lock, and `select_utxos_inner`
+// also publishes the reservation before dropping it, so select+reserve is one critical section
+// serialized by the wallet lock and no two builds can pick the same coin. A splice keeps its
+// coins live (it signs later, in a detached event), so this lock order is the only thing stopping
+// a concurrent open/withdrawal from reselecting a splice-reserved coin. Deadlock-free because the
+// release paths take `reserved_utxos` alone, never while holding the wallet lock.
 pub(crate) struct Wallet {
 	// A BDK on-chain wallet.
 	inner: Mutex<PersistedWallet<KVStoreWalletPersister>>,
@@ -251,8 +258,8 @@ impl Wallet {
 	) -> Result<Transaction, Error> {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
 
-		let reserved = self.reserved_outpoints();
 		let mut locked_wallet = self.inner.lock().unwrap();
+		let reserved = self.reserved_outpoints();
 		let mut tx_builder = locked_wallet.build_tx();
 
 		tx_builder
@@ -371,9 +378,8 @@ impl Wallet {
 	// Total value of coins currently reserved for in-flight splices. Splices only reserve confirmed
 	// coins, so this is the confirmed amount that is no longer spendable.
 	fn reserved_confirmed_sat(&self) -> u64 {
-		// Snapshot and drop the reserved lock before taking the wallet lock: the two never overlap.
-		let reserved = self.reserved_outpoints();
 		let locked_wallet = self.inner.lock().unwrap();
+		let reserved = self.reserved_outpoints();
 		reserved
 			.iter()
 			.filter_map(|outpoint| locked_wallet.get_utxo(*outpoint))
@@ -417,11 +423,10 @@ impl Wallet {
 		let fee_rate =
 			fee_rate.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(confirmation_target));
 
-		// Exclude coins reserved for an in-flight splice.
-		let reserved = self.reserved_outpoints();
-
 		let tx = {
 			let mut locked_wallet = self.inner.lock().unwrap();
+			// Exclude coins reserved for an in-flight splice.
+			let reserved = self.reserved_outpoints();
 
 			// Prepare the tx_builder. We properly check the reserve requirements (again) further down.
 			const DUST_LIMIT_SATS: u64 = 546;
@@ -640,8 +645,8 @@ impl Wallet {
 	fn select_utxos_inner(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
 	) -> Result<(Vec<FundingTxInput>, Vec<OutPoint>), ()> {
-		let reserved = self.reserved_outpoints();
 		let mut locked_wallet = self.inner.lock().unwrap();
+		let reserved = self.reserved_outpoints();
 		debug_assert!(matches!(
 			locked_wallet.public_descriptor(KeychainKind::External),
 			ExtendedDescriptor::Wpkh(_)
@@ -710,10 +715,9 @@ impl Wallet {
 			})
 			.collect::<Result<Vec<_>, ()>>()?;
 
-		// Drop the wallet lock before taking the reservation lock: the two never overlap.
-		drop(locked_wallet);
-
+		// Publish the reservation before releasing the wallet lock (see struct lock-ordering note).
 		self.reserved_utxos.lock().unwrap().extend(selected_outpoints.iter().copied());
+		drop(locked_wallet);
 
 		Ok((inputs, selected_outpoints))
 	}
@@ -773,10 +777,9 @@ impl Wallet {
 	}
 
 	fn list_confirmed_utxos_inner(&self) -> Result<Vec<Utxo>, ()> {
-		// Snapshot and drop the reserved lock before taking the wallet lock: the two never overlap.
+		let locked_wallet = self.inner.lock().unwrap();
 		let reserved: HashSet<OutPoint> =
 			self.reserved_utxos.lock().unwrap().iter().copied().collect();
-		let locked_wallet = self.inner.lock().unwrap();
 		let mut utxos = Vec::new();
 		let confirmed_txs: Vec<Txid> = locked_wallet
 			.transactions()
