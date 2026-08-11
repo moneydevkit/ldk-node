@@ -3,16 +3,19 @@
 
   inputs = {
     # Nixpkgs channel. New channels are released every 6 months.
-    # See: https://github.com/NixOS/nixpkgs/tags
-    nixpkgs.url = "github:nixos/nixpkgs/25.11";
+    # See: https://github.com/NixOS/nixpkgs/branches
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     # This makes it easy for the flake to be multi-platform.
     # See: https://github.com/numtide/flake-utils
     flake-utils.url = "github:numtide/flake-utils";
 
-    # Provides Rust toolchains.
-    # See: https://github.com/oxalica/rust-overlay
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    # Provides pinned Rust toolchains.
+    # See: https://github.com/nix-community/fenix
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     # Pinned nixpkgs that ships bitcoind 27.1. The integration tests' bundled
     # `corepc-node` deserializes the 27.x `getblockchaininfo` schema, so newer
@@ -25,24 +28,19 @@
       self,
       nixpkgs,
       flake-utils,
-      rust-overlay,
+      fenix,
       nixpkgs-bitcoind,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        # Overlays provide additional packages not available in the channels.
-        overlays = [
-          # Provides the rust-bin package; a set of pre-built Rust toolchains.
-          (import rust-overlay)
-        ];
-
         # The final set of packages.
         pkgs = import nixpkgs {
           # Inheriting from system is what makes this multi-platform.
-          # We also inherit the overlays that we want to use.
-          inherit system overlays;
+          inherit system;
         };
+
+        fenixPkgs = fenix.packages.${system};
 
         # bitcoind 27.1 from the pinned input (see inputs above).
         bitcoind = nixpkgs-bitcoind.legacyPackages.${system}.bitcoind;
@@ -53,17 +51,23 @@
         # deliberately exclude `rustfmt`: this repo's `rustfmt.toml` relies on
         # nightly-only options, so formatting is supplied by `rustfmt-nightly`
         # below to keep `just fmt`/`just check` consistent with CI's nightly job.
-        rust-toolchain = pkgs.rust-bin.stable."1.85.1".minimal.override {
-          extensions = [
-            "rust-src" # Needed for the rust-analyzer extension to work.
-            "clippy" # Linter used by `just check`.
-          ];
-        };
+        rust-toolchain =
+          (fenixPkgs.toolchainOf {
+            channel = "1.85.1";
+            sha256 = "sha256-Hn2uaQzRLidAWpfmRwSRdImifGUCAb9HeAqTYFXWeQk=";
+          }).withComponents
+            [
+              "rustc"
+              "cargo"
+              "rust-std"
+              "rust-src" # Needed for the rust-analyzer extension to work.
+              "clippy" # Linter used by `just check`.
+            ];
 
         # Nightly rustfmt only. `cargo fmt` shells out to whichever `rustfmt` is
         # on PATH, so a nightly rustfmt lets the nightly-only options in
         # `rustfmt.toml` apply even though cargo/rustc are pinned to stable.
-        rustfmt-nightly = pkgs.rust-bin.nightly.latest.rustfmt;
+        rustfmt-nightly = fenixPkgs.latest.rustfmt;
 
         # Esplora/HTTP electrs for the integration tests' Esplora chain source.
         #
