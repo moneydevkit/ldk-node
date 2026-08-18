@@ -42,17 +42,17 @@ default = []
 # lightning-macros = { version = "0.2.0" }
 
 # Branch: https://github.com/moneydevkit/rust-lightning/commits/lsp-0.2.5/
-lightning = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["std"] }
-lightning-types = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06" }
-lightning-invoice = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["std"] }
-lightning-net-tokio = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06" }
-lightning-persister = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["tokio"] }
-lightning-background-processor = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06" }
-lightning-rapid-gossip-sync = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06" }
-lightning-block-sync = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["rest-client", "rpc-client", "tokio"] }
-lightning-transaction-sync = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["esplora-async-https", "time", "electrum-rustls-ring"] }
-lightning-liquidity = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["std"] }
-lightning-macros = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06" }
+lightning = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["std"] }
+lightning-types = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e" }
+lightning-invoice = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["std"] }
+lightning-net-tokio = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e" }
+lightning-persister = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["tokio"] }
+lightning-background-processor = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e" }
+lightning-rapid-gossip-sync = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e" }
+lightning-block-sync = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["rest-client", "rpc-client", "tokio"] }
+lightning-transaction-sync = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["esplora-async-https", "time", "electrum-rustls-ring"] }
+lightning-liquidity = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["std"] }
+lightning-macros = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e" }
 
 #lightning = { path = "../rust-lightning/lightning", features = ["std"] }
 #lightning-types = { path = "../rust-lightning/lightning-types" }
@@ -101,7 +101,7 @@ winapi = { version = "0.3", features = ["winbase"] }
 [dev-dependencies]
 # lightning = { version = "0.2.0", features = ["std", "_test_utils"] }
 # Branch: https://github.com/moneydevkit/rust-lightning/commits/lsp-0.2.5/
-lightning = { git = "https://github.com/moneydevkit/rust-lightning", rev = "d6f87a44d0ee77a93094fca58dd5bd7349494a06", features = ["std", "_test_utils"] }
+lightning = { git = "https://github.com/moneydevkit/rust-lightning", rev = "a35e12311bf0b437f3ef9a7e00798eef5289930e", features = ["std", "_test_utils"] }
 #lightning = { path = "../rust-lightning/lightning", features = ["std", "_test_utils"] }
 proptest = "1.0.0"
 regex = "1.5.6"
