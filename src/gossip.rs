@@ -87,11 +87,8 @@ impl GossipSource {
 		match self {
 			Self::P2PNetwork { gossip_sync: _, .. } => Ok(0),
 			Self::RapidGossipSync { gossip_sync, server_url, latest_sync_timestamp, logger } => {
-				let query_timestamp = if do_full_sync {
-					0
-				} else {
-					latest_sync_timestamp.load(Ordering::Acquire)
-				};
+				let query_timestamp =
+					if do_full_sync { 0 } else { latest_sync_timestamp.load(Ordering::Acquire) };
 				let query_url = format!("{}/{}", server_url, query_timestamp);
 
 				let response = tokio::time::timeout(

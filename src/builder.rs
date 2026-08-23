@@ -831,7 +831,7 @@ impl NodeBuilder {
 		)
 	}
 
-		/// Builds a [`Node`] instance according to the options previously configured.
+	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store_and_runtime(
 		&self, kv_store: Arc<DynStore>, runtime: Arc<tokio::runtime::Runtime>,
 	) -> Result<Node, BuildError> {
@@ -2055,13 +2055,16 @@ pub(crate) fn sanitize_alias(alias_str: &str) -> Result<NodeAlias, BuildError> {
 
 #[cfg(test)]
 mod tests {
-	use super::{sanitize_alias, BuildError, NodeAlias, NodeBuilder};
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 	use lightning::ln::msgs::SocketAddress;
 
+	use super::{sanitize_alias, BuildError, NodeAlias, NodeBuilder};
+
 	fn dummy_lsp() -> (PublicKey, SocketAddress) {
-		let node_id =
-			PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[1u8; 32]).unwrap());
+		let node_id = PublicKey::from_secret_key(
+			&Secp256k1::new(),
+			&SecretKey::from_slice(&[1u8; 32]).unwrap(),
+		);
 		let address = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 9735 };
 		(node_id, address)
 	}

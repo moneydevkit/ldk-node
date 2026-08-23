@@ -87,9 +87,7 @@ impl ForwardCounters {
 		}
 	}
 
-	pub(crate) fn record_failure(
-		&self, direction: ForwardDirection, is_downstream: bool,
-	) {
+	pub(crate) fn record_failure(&self, direction: ForwardDirection, is_downstream: bool) {
 		match (direction, is_downstream) {
 			(ForwardDirection::ToClient, true) => {
 				self.failure_to_client_downstream.fetch_add(1, Ordering::Relaxed);
@@ -121,9 +119,7 @@ impl ForwardCounters {
 				.failure_from_client_downstream
 				.load(Ordering::Relaxed),
 			failure_from_client_local: self.failure_from_client_local.load(Ordering::Relaxed),
-			failure_invalid_forward_scid: self
-				.failure_invalid_forward_scid
-				.load(Ordering::Relaxed),
+			failure_invalid_forward_scid: self.failure_invalid_forward_scid.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -149,11 +145,12 @@ pub struct ForwardSnapshot {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 	use lightning::ln::channel_state::{ChannelCounterparty, ChannelDetails};
 	use lightning::ln::types::ChannelId;
 	use lightning_types::features::InitFeatures;
+
+	use super::*;
 
 	fn dummy_pubkey() -> PublicKey {
 		let secp = Secp256k1::new();
@@ -207,10 +204,7 @@ mod tests {
 
 	#[test]
 	fn classify_network_to_client() {
-		let channels = vec![
-			make_channel([1; 32], true),
-			make_channel([2; 32], false),
-		];
+		let channels = vec![make_channel([1; 32], true), make_channel([2; 32], false)];
 		assert_eq!(
 			ForwardCounters::classify(&channels, &cid(1), &cid(2)),
 			Some(ForwardDirection::ToClient),
@@ -219,10 +213,7 @@ mod tests {
 
 	#[test]
 	fn classify_client_to_network() {
-		let channels = vec![
-			make_channel([1; 32], false),
-			make_channel([2; 32], true),
-		];
+		let channels = vec![make_channel([1; 32], false), make_channel([2; 32], true)];
 		assert_eq!(
 			ForwardCounters::classify(&channels, &cid(1), &cid(2)),
 			Some(ForwardDirection::FromClient),
@@ -231,19 +222,13 @@ mod tests {
 
 	#[test]
 	fn classify_network_to_network_ignored() {
-		let channels = vec![
-			make_channel([1; 32], true),
-			make_channel([2; 32], true),
-		];
+		let channels = vec![make_channel([1; 32], true), make_channel([2; 32], true)];
 		assert_eq!(ForwardCounters::classify(&channels, &cid(1), &cid(2)), None);
 	}
 
 	#[test]
 	fn classify_client_to_client_is_to_client() {
-		let channels = vec![
-			make_channel([1; 32], false),
-			make_channel([2; 32], false),
-		];
+		let channels = vec![make_channel([1; 32], false), make_channel([2; 32], false)];
 		assert_eq!(
 			ForwardCounters::classify(&channels, &cid(1), &cid(2)),
 			Some(ForwardDirection::ToClient),
@@ -302,4 +287,3 @@ mod tests {
 		assert_eq!(snap.success_to_client, 0);
 	}
 }
-

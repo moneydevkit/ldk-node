@@ -116,7 +116,7 @@ pub(crate) type LiquidityManager<L> = lightning_liquidity::LiquidityManager<
 	Arc<DynStore>,
 	DefaultTimeProvider,
 	Arc<Broadcaster>,
-	L
+	L,
 >;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
