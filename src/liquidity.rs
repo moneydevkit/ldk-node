@@ -14,9 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey};
-use bitcoin::Transaction;
+use bitcoin::{Amount, Transaction};
 use chrono::Utc;
-use bitcoin::Amount;
 use lightning::events::bump_transaction::Input;
 use lightning::events::HTLCHandlingFailureType;
 use lightning::ln::chan_utils::{make_funding_redeemscript, FUNDING_TRANSACTION_WITNESS_WEIGHT};
@@ -24,8 +23,8 @@ use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::funding::SpliceContribution;
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::types::ChannelId;
-use lightning::util::errors::APIError;
 use lightning::routing::router::{RouteHint, RouteHintHop};
+use lightning::util::errors::APIError;
 use lightning::util::logger::Logger as LdkLogger;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, InvoiceBuilder, RoutingFees};
 use lightning_liquidity::events::LiquidityEvent;
@@ -52,12 +51,12 @@ use crate::builder::BuildError;
 use crate::chain::ChainSource;
 use crate::connection::ConnectionManager;
 use crate::event::EventQueue;
+use crate::fee_estimator::{self, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, Logger};
 use crate::runtime::Runtime;
 use crate::types::{
 	Broadcaster, ChannelManager, DynStore, KeysManager, LiquidityManager, PeerManager, Wallet,
 };
-use crate::fee_estimator::{self, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::{total_anchor_channels_reserve_sats, Config, Error};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -238,8 +237,8 @@ where
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 		chain_source: Arc<ChainSource>, tx_broadcaster: Arc<Broadcaster>,
-		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>,
-		config: Arc<Config>, logger: L, event_queue: Arc<EventQueue<L>>,
+		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		logger: L, event_queue: Arc<EventQueue<L>>,
 	) -> Self {
 		let lsps1_client = None;
 		let lsps2_client = None;
@@ -1135,7 +1134,10 @@ where
 				channel_count,
 			}) => {
 				if self.liquidity_manager.lsps4_service_handler().is_none() {
-					log_error!(self.logger, "Failed to handle SpliceChannel: LSPS4 service not configured.");
+					log_error!(
+						self.logger,
+						"Failed to handle SpliceChannel: LSPS4 service not configured."
+					);
 					return;
 				};
 
@@ -1144,7 +1146,10 @@ where
 				{
 					service_config
 				} else {
-					log_error!(self.logger, "Failed to handle SpliceChannel: LSPS4 service not configured.");
+					log_error!(
+						self.logger,
+						"Failed to handle SpliceChannel: LSPS4 service not configured."
+					);
 					return;
 				};
 
@@ -1153,7 +1158,11 @@ where
 					/ 1_000_000;
 				let splice_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
 
-				match self.splice_channel_for_lsps4(channel_id, their_network_key, splice_amount_sats) {
+				match self.splice_channel_for_lsps4(
+					channel_id,
+					their_network_key,
+					splice_amount_sats,
+				) {
 					Ok(()) => {
 						log_info!(
 							self.logger,
@@ -1207,7 +1216,7 @@ where
 			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::OpenChannel {
 				their_network_key,
 				amt_to_forward_msat,
-				channel_count
+				channel_count,
 			}) => {
 				if self.liquidity_manager.lsps4_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS4ServiceEvent as LSPS4 liquidity service was not configured.",);
@@ -1255,10 +1264,8 @@ where
 					service_config.min_channel_size_msat / 1000,
 				);
 				if !service_config.channel_size_tiers.is_empty() {
-					let tier_index = std::cmp::min(
-						channel_count,
-						service_config.channel_size_tiers.len() - 1,
-					);
+					let tier_index =
+						std::cmp::min(channel_count, service_config.channel_size_tiers.len() - 1);
 					if let Some(tier_value_sats) =
 						service_config.channel_size_tiers.get(tier_index).copied()
 					{
@@ -1299,7 +1306,6 @@ where
 				}
 
 				let mut config = self.channel_manager.get_current_config().clone();
-
 
 				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
 				debug_assert_eq!(
@@ -1344,7 +1350,10 @@ where
 					},
 				}
 			},
-			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::SendWebhook { counterparty_node_id, payment_hash }) => {
+			LiquidityEvent::LSPS4Service(LSPS4ServiceEvent::SendWebhook {
+				counterparty_node_id,
+				payment_hash,
+			}) => {
 				if let (Some(client), Some(url)) = (&self.webhook_client, &self.webhook_url) {
 					let mut json_body = HashMap::new();
 					json_body.insert("nodeId", counterparty_node_id.to_string());
@@ -1945,9 +1954,7 @@ where
 		}
 
 		if let Some(lsps4_service_handler) = self.liquidity_manager.lsps4_service_handler() {
-			if let Err(e) = lsps4_service_handler
-				.channel_ready(counterparty_node_id)
-			{
+			if let Err(e) = lsps4_service_handler.channel_ready(counterparty_node_id) {
 				log_error!(
 					self.logger,
 					"LSPS4 service failed to handle ChannelReady event: {:?}",
@@ -1985,8 +1992,7 @@ where
 				intercept_id,
 				expected_outbound_amount_msat,
 				payment_hash,
-				) 
-			{
+			) {
 				log_error!(
 					self.logger,
 					"LSPS4 service failed to handle HTLCIntercepted event: {:?}",
@@ -2029,11 +2035,9 @@ where
 	/// Splice into an existing channel for LSPS4. Mirrors Node::splice_in().
 	/// Returns raw APIError so the caller can distinguish "splice already pending."
 	fn splice_channel_for_lsps4(
-		&self, channel_id: ChannelId, counterparty_node_id: PublicKey,
-		splice_amount_sats: u64,
+		&self, channel_id: ChannelId, counterparty_node_id: PublicKey, splice_amount_sats: u64,
 	) -> Result<(), APIError> {
-		let channels =
-			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channels = self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
 		let channel_details = channels.iter().find(|c| c.channel_id == channel_id).ok_or(
 			APIError::APIMisuseError {
 				err: format!("Channel {} not found for splice", channel_id),
@@ -2063,8 +2067,7 @@ where
 			script_pubkey: make_funding_redeemscript(&dummy_pubkey, &dummy_pubkey).to_p2wsh(),
 		};
 
-		let fee_rate =
-			self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+		let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
 
 		let (inputs, reserved_outpoints) = self
 			.wallet
@@ -2073,10 +2076,9 @@ where
 				err: "Insufficient confirmed UTXOs for splice".to_string(),
 			})?;
 
-		let change_address =
-			self.wallet.get_new_internal_address().map_err(|e| APIError::APIMisuseError {
-				err: format!("Failed to get change address: {:?}", e),
-			})?;
+		let change_address = self.wallet.get_new_internal_address().map_err(|e| {
+			APIError::APIMisuseError { err: format!("Failed to get change address: {:?}", e) }
+		})?;
 
 		let contribution = SpliceContribution::SpliceIn {
 			value: Amount::from_sat(splice_amount_sats),
@@ -2112,21 +2114,21 @@ where
 	/// Open a channel for LSPS4. Extracted from the OpenChannel event handler
 	/// so it can be reused as a splice fallback.
 	fn open_channel_for_lsps4(
-		&self, their_network_key: PublicKey, amt_to_forward_msat: u64,
-		channel_count: usize,
+		&self, their_network_key: PublicKey, amt_to_forward_msat: u64, channel_count: usize,
 	) -> Result<(), Error> {
 		let service_config = if let Some(service_config) =
 			self.lsps4_service.as_ref().map(|s| s.service_config.clone())
 		{
 			service_config
 		} else {
-			log_error!(self.logger, "Failed to handle LSPS4 open channel: LSPS4 service not configured.");
+			log_error!(
+				self.logger,
+				"Failed to handle LSPS4 open channel: LSPS4 service not configured."
+			);
 			return Err(Error::LiquiditySourceUnavailable);
 		};
 
-		let init_features = if let Some(peer_manager) =
-			self.peer_manager.read().unwrap().as_ref()
-		{
+		let init_features = if let Some(peer_manager) = self.peer_manager.read().unwrap().as_ref() {
 			if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
 				peer.init_features
 			} else {
@@ -2138,22 +2140,22 @@ where
 				return Err(Error::ConnectionFailed);
 			}
 		} else {
-			log_error!(self.logger, "Failed to handle LSPS4 open channel: peer manager unavailable.");
+			log_error!(
+				self.logger,
+				"Failed to handle LSPS4 open channel: peer manager unavailable."
+			);
 			return Err(Error::LiquiditySourceUnavailable);
 		};
 
-		let over_provisioning_msat = (amt_to_forward_msat
-			* service_config.channel_over_provisioning_ppm as u64)
-			/ 1_000_000;
+		let over_provisioning_msat =
+			(amt_to_forward_msat * service_config.channel_over_provisioning_ppm as u64) / 1_000_000;
 		let mut channel_amount_sats = std::cmp::max(
 			(amt_to_forward_msat + over_provisioning_msat) / 1000,
 			service_config.min_channel_size_msat / 1000,
 		);
 		if !service_config.channel_size_tiers.is_empty() {
-			let tier_index = std::cmp::min(
-				channel_count,
-				service_config.channel_size_tiers.len() - 1,
-			);
+			let tier_index =
+				std::cmp::min(channel_count, service_config.channel_size_tiers.len() - 1);
 			if let Some(tier_value_sats) =
 				service_config.channel_size_tiers.get(tier_index).copied()
 			{
@@ -2184,9 +2186,7 @@ where
 
 		let mut config = self.channel_manager.get_current_config().clone();
 		debug_assert_eq!(
-			config
-				.channel_handshake_config
-				.max_inbound_htlc_value_in_flight_percent_of_channel,
+			config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel,
 			100
 		);
 		debug_assert!(config.accept_forwards_to_priv_channels);
@@ -2400,9 +2400,7 @@ mod tests {
 		};
 		assert!(!is_splice_already_pending(&zero_err));
 
-		let channel_unavailable = APIError::ChannelUnavailable {
-			err: "some error".to_string(),
-		};
+		let channel_unavailable = APIError::ChannelUnavailable { err: "some error".to_string() };
 		assert!(!is_splice_already_pending(&channel_unavailable));
 	}
 }

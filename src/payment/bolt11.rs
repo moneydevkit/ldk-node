@@ -968,11 +968,7 @@ impl Bolt11Payment {
 
 		let already_known = self.payment_store.insert(payment)?;
 		if already_known {
-			log_error!(
-				self.logger,
-				"LSPS4 JIT payment with ID {} was previously known",
-				id,
-			);
+			log_error!(self.logger, "LSPS4 JIT payment with ID {} was previously known", id,);
 			debug_assert!(false);
 		}
 

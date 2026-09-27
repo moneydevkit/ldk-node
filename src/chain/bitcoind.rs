@@ -438,14 +438,13 @@ impl BitcoindChainSource {
 		let now = SystemTime::now();
 
 		let wallet_ref = onchain_wallet.clone();
-		let bdk_unconfirmed_txids = tokio::task::spawn_blocking(move || {
-			wallet_ref.get_unconfirmed_txids()
-		})
-		.await
-		.map_err(|e| {
-			log_error!(self.logger, "Failed to retrieve unconfirmed txids: {}", e);
-			Error::WalletOperationFailed
-		})?;
+		let bdk_unconfirmed_txids =
+			tokio::task::spawn_blocking(move || wallet_ref.get_unconfirmed_txids()).await.map_err(
+				|e| {
+					log_error!(self.logger, "Failed to retrieve unconfirmed txids: {}", e);
+					Error::WalletOperationFailed
+				},
+			)?;
 
 		match self
 			.api_client

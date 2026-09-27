@@ -36,11 +36,11 @@ use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
+use crate::forward_metrics::ForwardCounters;
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::forward_metrics::ForwardCounters;
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
@@ -240,7 +240,7 @@ pub enum Event {
 		/// The node id of the node that needs to be notified.
 		node_id: PublicKey,
 		/// The payment hash
-		payment_hash: PaymentHash
+		payment_hash: PaymentHash,
 	},
 	/// A channel splice is pending confirmation on-chain.
 	SplicePending {
@@ -567,7 +567,10 @@ where
 				let w = Arc::clone(&self.wallet);
 				let funding_res = tokio::task::spawn_blocking(move || {
 					w.create_funding_transaction(
-						output_script, channel_amount, confirmation_target, locktime,
+						output_script,
+						channel_amount,
+						confirmation_target,
+						locktime,
 					)
 				})
 				.await
@@ -725,16 +728,14 @@ where
 
 					let max_total_opening_fee_msat = match info.kind {
 						PaymentKind::Bolt11Jit { lsp_fee_limits, .. } => {
-							lsp_fee_limits
-								.max_total_opening_fee_msat
-								.or_else(|| {
-									lsp_fee_limits.max_proportional_opening_fee_ppm_msat.and_then(
-										|max_prop_fee| {
-											// If it's a variable amount payment, compute the actual fee.
-											compute_opening_fee(amount_msat, 0, max_prop_fee)
-										},
-									)
-								})
+							lsp_fee_limits.max_total_opening_fee_msat.or_else(|| {
+								lsp_fee_limits.max_proportional_opening_fee_ppm_msat.and_then(
+									|max_prop_fee| {
+										// If it's a variable amount payment, compute the actual fee.
+										compute_opening_fee(amount_msat, 0, max_prop_fee)
+									},
+								)
+							})
 						},
 						_ => None,
 					};
@@ -758,7 +759,11 @@ where
 							match self.payment_store.update(&update) {
 								Ok(_) => return Ok(()),
 								Err(e) => {
-									log_error!(self.logger, "Failed to access payment store: {}", e);
+									log_error!(
+										self.logger,
+										"Failed to access payment store: {}",
+										e
+									);
 									return Err(ReplayEvent());
 								},
 							};
@@ -1147,15 +1152,9 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed {
-				prev_channel_id,
-				failure_type,
-				failure_reason,
-			} => {
+			LdkEvent::HTLCHandlingFailed { prev_channel_id, failure_type, failure_reason } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source
-						.handle_htlc_handling_failed(failure_type.clone())
-						.await;
+					liquidity_source.handle_htlc_handling_failed(failure_type.clone()).await;
 				}
 
 				match &failure_type {
@@ -1164,11 +1163,9 @@ where
 						..
 					} => {
 						let channels = self.channel_manager.list_channels();
-						if let Some(dir) = ForwardCounters::classify(
-							&channels,
-							&prev_channel_id,
-							next_channel_id,
-						) {
+						if let Some(dir) =
+							ForwardCounters::classify(&channels, &prev_channel_id, next_channel_id)
+						{
 							let is_downstream = matches!(
 								failure_reason,
 								Some(lightning::events::HTLCHandlingFailureReason::Downstream)
@@ -1286,9 +1283,11 @@ where
 				let user_channel_id: u128 = rng().random();
 				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
 				let mut channel_override_config = None;
-				if let Some((lsp_node_id, _)) = self.liquidity_source.as_ref().and_then(|ls| {
-					ls.get_lsps2_lsp_details().or(ls.get_lsps4_lsp_details())
-				}) {
+				if let Some((lsp_node_id, _)) = self
+					.liquidity_source
+					.as_ref()
+					.and_then(|ls| ls.get_lsps2_lsp_details().or(ls.get_lsps4_lsp_details()))
+				{
 					if lsp_node_id == counterparty_node_id {
 						// When we're an LSPS2/4 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
 						// check that they don't take too much before claiming.
@@ -1429,9 +1428,7 @@ where
 				}
 
 				if let (Some(prev_cid), Some(next_cid)) = (prev_channel_id, next_channel_id) {
-					if let Some(dir) =
-						ForwardCounters::classify(&channels, &prev_cid, &next_cid)
-					{
+					if let Some(dir) = ForwardCounters::classify(&channels, &prev_cid, &next_cid) {
 						self.forward_counters.record_success(dir);
 					}
 				}
