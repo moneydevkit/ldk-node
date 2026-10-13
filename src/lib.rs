@@ -86,8 +86,8 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
-pub mod forward_metrics;
 mod ffi;
+pub mod forward_metrics;
 mod gossip;
 pub mod graph;
 mod hex_utils;
@@ -125,11 +125,11 @@ use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
-pub use forward_metrics::ForwardCounters;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 #[cfg(feature = "uniffi")]
 use ffi::*;
+pub use forward_metrics::ForwardCounters;
 use gossip::GossipSource;
 use graph::NetworkGraph;
 pub use io::utils::generate_entropy_mnemonic;
@@ -319,7 +319,7 @@ impl Node {
 										gossip_sync_logger,
 										"Background sync of RGS gossip data failed: {}",
 										e
-									)
+									);
 								}
 							}
 						}
@@ -647,8 +647,10 @@ impl Node {
 					tokio::time::interval(Duration::from_secs(PENDING_HTLC_RETRY_INTERVAL_SECS));
 				let mut expiry_check_interval =
 					tokio::time::interval(Duration::from_secs(HTLC_EXPIRY_CHECK_INTERVAL_SECS));
-				pending_htlc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-				expiry_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				pending_htlc_interval
+					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				expiry_check_interval
+					.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 				// First tick fires immediately; consume it so we don't run at t=0.
 				pending_htlc_interval.tick().await;
 				expiry_check_interval.tick().await;
@@ -1100,7 +1102,7 @@ impl Node {
 		match self.peer_store.remove_peer(&counterparty_node_id) {
 			Ok(()) => {},
 			Err(e) => {
-				log_error!(self.logger, "Failed to remove peer {}: {}", counterparty_node_id, e)
+				log_error!(self.logger, "Failed to remove peer {}: {}", counterparty_node_id, e);
 			},
 		}
 
@@ -1130,7 +1132,7 @@ impl Node {
 		})?;
 
 		// Check funds availability after connection (includes anchor reserve calculation)
-		self.check_sufficient_funds_for_channel(channel_amount_sats, &node_id)?;
+		self.check_sufficient_onchain_funds(channel_amount_sats, &node_id, true)?;
 
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
@@ -1171,46 +1173,52 @@ impl Node {
 		}
 	}
 
-	fn check_sufficient_funds_for_channel(
-		&self, amount_sats: u64, peer_node_id: &PublicKey,
+	fn check_sufficient_onchain_funds(
+		&self, amount_sats: u64, peer_node_id: &PublicKey, for_new_channel: bool,
 	) -> Result<(), Error> {
+		let action_str = if for_new_channel { "create channel" } else { "splice-in" };
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let spendable_amount_sats =
 			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 
-		// Fail early if we have less than the channel value available.
 		if spendable_amount_sats < amount_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, amount_sats
+			log_error!(
+				self.logger,
+				"Unable to {} due to insufficient funds. Available: {}sats, Required: {}sats",
+				action_str,
+				spendable_amount_sats,
+				amount_sats
 			);
 			return Err(Error::InsufficientFunds);
 		}
 
-		// Fail if we have less than the channel value + anchor reserve available (if applicable).
-		let init_features = self
-			.peer_manager
-			.peer_by_node_id(peer_node_id)
-			.ok_or(Error::ConnectionFailed)?
-			.init_features;
-		let required_funds_sats = amount_sats
-			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
-				if init_features.requires_anchors_zero_fee_htlc_tx()
-					&& !c.trusted_peers_no_reserve.contains(peer_node_id)
-				{
-					c.per_channel_reserve_sats
-				} else {
-					0
-				}
-			});
+		if for_new_channel {
+			// Fail if we have less than the channel value + anchor reserve available (if
+			// applicable).
+			let init_features = self
+				.peer_manager
+				.peer_by_node_id(peer_node_id)
+				.ok_or(Error::ConnectionFailed)?
+				.init_features;
+			let required_funds_sats = amount_sats
+				+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+					if init_features.supports_anchors_zero_fee_htlc_tx()
+						&& !c.trusted_peers_no_reserve.contains(peer_node_id)
+					{
+						c.per_channel_reserve_sats
+					} else {
+						0
+					}
+				});
 
-		if spendable_amount_sats < required_funds_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, required_funds_sats
-			);
-			return Err(Error::InsufficientFunds);
+			if spendable_amount_sats < required_funds_sats {
+				log_error!(self.logger,
+					"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+					spendable_amount_sats, required_funds_sats
+				);
+				return Err(Error::InsufficientFunds);
+			}
 		}
 
 		Ok(())
@@ -1306,7 +1314,7 @@ impl Node {
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			self.check_sufficient_funds_for_channel(splice_amount_sats, &counterparty_node_id)?;
+			self.check_sufficient_onchain_funds(splice_amount_sats, &counterparty_node_id, false)?;
 
 			const EMPTY_SCRIPT_SIG_WEIGHT: u64 =
 				1 /* empty script_sig */ * bitcoin::constants::WITNESS_SCALE_FACTOR as u64;
@@ -1413,7 +1421,9 @@ impl Node {
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			if splice_amount_sats > channel_details.outbound_capacity_msat {
+			let splice_amount_msat =
+				splice_amount_sats.checked_mul(1_000).ok_or(Error::ChannelSplicingFailed)?;
+			if splice_amount_msat > channel_details.outbound_capacity_msat {
 				return Err(Error::ChannelSplicingFailed);
 			}
 
@@ -1925,7 +1935,7 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
 					&& c.channel_type
 						.as_ref()
-						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
+						.map_or(true, |t| t.requires_anchors_zero_fee_htlc_tx())
 			})
 			.count() as u64
 			* anchor_channels_config.per_channel_reserve_sats

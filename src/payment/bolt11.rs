@@ -331,7 +331,7 @@ impl Bolt11Payment {
 				_ => 0,
 			};
 			if let Some(invoice_amount_msat) = details.amount_msat {
-				if claimable_amount_msat < invoice_amount_msat - skimmed_fee_msat {
+				if claimable_amount_msat < invoice_amount_msat.saturating_sub(skimmed_fee_msat) {
 					log_error!(
 						self.logger,
 						"Failed to manually claim payment {} as the claimable amount is less than expected",
@@ -968,11 +968,7 @@ impl Bolt11Payment {
 
 		let already_known = self.payment_store.insert(payment)?;
 		if already_known {
-			log_error!(
-				self.logger,
-				"LSPS4 JIT payment with ID {} was previously known",
-				id,
-			);
+			log_error!(self.logger, "LSPS4 JIT payment with ID {} was previously known", id,);
 			debug_assert!(false);
 		}
 

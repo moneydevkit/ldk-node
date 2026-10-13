@@ -19,7 +19,7 @@ use lightning::events::{
 	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
 use lightning::impl_writeable_tlv_based_enum;
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{FailureCode, PaymentId};
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{
@@ -36,11 +36,11 @@ use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
+use crate::forward_metrics::ForwardCounters;
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::forward_metrics::ForwardCounters;
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
@@ -240,7 +240,7 @@ pub enum Event {
 		/// The node id of the node that needs to be notified.
 		node_id: PublicKey,
 		/// The payment hash
-		payment_hash: PaymentHash
+		payment_hash: PaymentHash,
 	},
 	/// A channel splice is pending confirmation on-chain.
 	SplicePending {
@@ -567,7 +567,10 @@ where
 				let w = Arc::clone(&self.wallet);
 				let funding_res = tokio::task::spawn_blocking(move || {
 					w.create_funding_transaction(
-						output_script, channel_amount, confirmation_target, locktime,
+						output_script,
+						channel_amount,
+						confirmation_target,
+						locktime,
 					)
 				})
 				.await
@@ -632,14 +635,14 @@ where
 											self.logger,
 											"Failed to process funding transaction as channel went away before we could fund it: {}",
 											err
-										)
+										);
 									},
 									err => {
 										log_error!(
 											self.logger,
 											"Failed to process funding transaction: {:?}",
 											err
-										)
+										);
 									},
 								}
 							},
@@ -677,6 +680,22 @@ where
 				..
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
+
+				if let Some((tlv_type, _)) = onion_fields
+					.as_ref()
+					.and_then(|fields| fields.custom_tlvs().iter().find(|(id, _)| id % 2 == 0))
+				{
+					log_info!(
+						self.logger,
+						"Refusing inbound payment with hash {} as the sender included unknown required TLVs (incl {})",
+						hex_utils::to_string(&payment_hash.0),
+						tlv_type,
+					);
+					let error_code = FailureCode::InvalidOnionPayload(Some((*tlv_type, 0)));
+					self.channel_manager.fail_htlc_backwards_with_reason(&payment_hash, error_code);
+					return Ok(());
+				}
+
 				if let Some(info) = self.payment_store.get(&payment_id) {
 					if info.direction == PaymentDirection::Outbound {
 						log_info!(
@@ -685,18 +704,7 @@ where
 							payment_id
 						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
-
-						let update = PaymentDetailsUpdate {
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						match self.payment_store.update(&update) {
-							Ok(_) => return Ok(()),
-							Err(e) => {
-								log_error!(self.logger, "Failed to access payment store: {}", e);
-								return Err(ReplayEvent());
-							},
-						};
+						return Ok(());
 					}
 
 					if info.status == PaymentStatus::Succeeded
@@ -709,32 +717,19 @@ where
 							amount_msat,
 						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
-
-						let update = PaymentDetailsUpdate {
-							status: Some(PaymentStatus::Failed),
-							..PaymentDetailsUpdate::new(payment_id)
-						};
-						match self.payment_store.update(&update) {
-							Ok(_) => return Ok(()),
-							Err(e) => {
-								log_error!(self.logger, "Failed to access payment store: {}", e);
-								return Err(ReplayEvent());
-							},
-						};
+						return Ok(());
 					}
 
 					let max_total_opening_fee_msat = match info.kind {
 						PaymentKind::Bolt11Jit { lsp_fee_limits, .. } => {
-							lsp_fee_limits
-								.max_total_opening_fee_msat
-								.or_else(|| {
-									lsp_fee_limits.max_proportional_opening_fee_ppm_msat.and_then(
-										|max_prop_fee| {
-											// If it's a variable amount payment, compute the actual fee.
-											compute_opening_fee(amount_msat, 0, max_prop_fee)
-										},
-									)
-								})
+							lsp_fee_limits.max_total_opening_fee_msat.or_else(|| {
+								lsp_fee_limits.max_proportional_opening_fee_ppm_msat.and_then(
+									|max_prop_fee| {
+										// If it's a variable amount payment, compute the actual fee.
+										compute_opening_fee(amount_msat, 0, max_prop_fee)
+									},
+								)
+							})
 						},
 						_ => None,
 					};
@@ -758,7 +753,11 @@ where
 							match self.payment_store.update(&update) {
 								Ok(_) => return Ok(()),
 								Err(e) => {
-									log_error!(self.logger, "Failed to access payment store: {}", e);
+									log_error!(
+										self.logger,
+										"Failed to access payment store: {}",
+										e
+									);
 									return Err(ReplayEvent());
 								},
 							};
@@ -824,6 +823,18 @@ where
 						},
 						_ => {},
 					}
+				} else if counterparty_skimmed_fee_msat > 0 {
+					// We only ever authorize an LSP to withhold a fee for JIT-channel payments we
+					// previously registered. Any other payment (e.g., BOLT12 offer or spontaneous
+					// payments, for which no record exists yet) must not have fees skimmed.
+					log_info!(
+						self.logger,
+						"Refusing inbound payment with hash {} as the counterparty withheld {}msat without a corresponding JIT-channel payment authorizing it",
+						hex_utils::to_string(&payment_hash.0),
+						counterparty_skimmed_fee_msat,
+					);
+					self.channel_manager.fail_htlc_backwards(&payment_hash);
+					return Ok(());
 				}
 
 				log_info!(
@@ -1084,8 +1095,7 @@ where
 				self.payment_store.get(&payment_id).map(|payment| {
 					log_info!(
 						self.logger,
-						"Successfully sent payment of {}msat{} from \
-						payment hash {:?} with preimage {:?}",
+						"Successfully sent payment of {}msat{} with payment hash {}",
 						payment.amount_msat.unwrap(),
 						if let Some(fee) = fee_paid_msat {
 							format!(" (fee {} msat)", fee)
@@ -1093,7 +1103,6 @@ where
 							"".to_string()
 						},
 						hex_utils::to_string(&payment_hash.0),
-						hex_utils::to_string(&payment_preimage.0)
 					);
 				});
 				let event = Event::PaymentSuccessful {
@@ -1112,6 +1121,22 @@ where
 				};
 			},
 			LdkEvent::PaymentFailed { payment_id, payment_hash, reason, .. } => {
+				// LDK may emit PaymentFailed after PaymentSent. Ignore the entire late failure so
+				// it cannot alter payment metadata or emit a contradictory event.
+				if let Some(payment) = self.payment_store.get(&payment_id) {
+					if payment.direction == PaymentDirection::Outbound
+						&& payment.kind.is_lightning_payment()
+						&& payment.status == PaymentStatus::Succeeded
+					{
+						log_info!(
+							self.logger,
+							"Ignoring late payment failure for already-succeeded payment with ID {}.",
+							payment_id
+						);
+						return Ok(());
+					}
+				}
+
 				log_info!(
 					self.logger,
 					"Failed to send payment with ID {} due to {:?}.",
@@ -1147,15 +1172,9 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed {
-				prev_channel_id,
-				failure_type,
-				failure_reason,
-			} => {
+			LdkEvent::HTLCHandlingFailed { prev_channel_id, failure_type, failure_reason } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source
-						.handle_htlc_handling_failed(failure_type.clone())
-						.await;
+					liquidity_source.handle_htlc_handling_failed(failure_type.clone()).await;
 				}
 
 				match &failure_type {
@@ -1164,11 +1183,9 @@ where
 						..
 					} => {
 						let channels = self.channel_manager.list_channels();
-						if let Some(dir) = ForwardCounters::classify(
-							&channels,
-							&prev_channel_id,
-							next_channel_id,
-						) {
+						if let Some(dir) =
+							ForwardCounters::classify(&channels, &prev_channel_id, next_channel_id)
+						{
 							let is_downstream = matches!(
 								failure_reason,
 								Some(lightning::events::HTLCHandlingFailureReason::Downstream)
@@ -1216,7 +1233,7 @@ where
 								"Channel request rejected".to_string(),
 							)
 							.unwrap_or_else(|e| {
-								log_error!(self.logger, "Failed to reject channel: {:?}", e)
+								log_error!(self.logger, "Failed to reject channel: {:?}", e);
 							});
 						return Ok(());
 					}
@@ -1260,7 +1277,7 @@ where
 									"Channel request rejected".to_string(),
 								)
 								.unwrap_or_else(|e| {
-									log_error!(self.logger, "Failed to reject channel: {:?}", e)
+									log_error!(self.logger, "Failed to reject channel: {:?}", e);
 								});
 							return Ok(());
 						}
@@ -1277,7 +1294,7 @@ where
 								"Channel request rejected".to_string(),
 							)
 							.unwrap_or_else(|e| {
-								log_error!(self.logger, "Failed to reject channel: {:?}", e)
+								log_error!(self.logger, "Failed to reject channel: {:?}", e);
 							});
 						return Ok(());
 					}
@@ -1286,9 +1303,11 @@ where
 				let user_channel_id: u128 = rng().random();
 				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
 				let mut channel_override_config = None;
-				if let Some((lsp_node_id, _)) = self.liquidity_source.as_ref().and_then(|ls| {
-					ls.get_lsps2_lsp_details().or(ls.get_lsps4_lsp_details())
-				}) {
+				if let Some((lsp_node_id, _)) = self
+					.liquidity_source
+					.as_ref()
+					.and_then(|ls| ls.get_lsps2_lsp_details().or(ls.get_lsps4_lsp_details()))
+				{
 					if lsp_node_id == counterparty_node_id {
 						// When we're an LSPS2/4 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
 						// check that they don't take too much before claiming.
@@ -1429,9 +1448,7 @@ where
 				}
 
 				if let (Some(prev_cid), Some(next_cid)) = (prev_channel_id, next_channel_id) {
-					if let Some(dir) =
-						ForwardCounters::classify(&channels, &prev_cid, &next_cid)
-					{
+					if let Some(dir) = ForwardCounters::classify(&channels, &prev_cid, &next_cid) {
 						self.forward_counters.record_success(dir);
 					}
 				}
