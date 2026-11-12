@@ -2526,7 +2526,9 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 	let service_node_id = service_node.node_id();
 	let service_listen_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
 
-	let client_config = random_config(true);
+	let mut client_config = random_config(true);
+	// Like lightning-js clients: lock the service's splices at 0-conf, as we trust it.
+	client_config.node_config.inbound_splice_minimum_depth = None;
 	setup_builder!(client_builder, client_config.node_config);
 	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr, None);
@@ -2569,12 +2571,13 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 	let tier0_channel_size_sat = 100_000;
 
 	// Drive a single JIT payment to completion and return the client's resulting channel
-	// value with the service. A liquidity action (initial open or splice) may be needed;
-	// splices must confirm on-chain before the channel is usable again, so we mine blocks
-	// whenever one is pending and keep draining events until the payment is both forwarded
-	// by the service and received by the client.
+	// value with the service. A liquidity action (initial open or splice) may be needed.
+	// With `$mine` we mine blocks whenever one is pending; without it the payment must
+	// complete with no new blocks, as the client trusts the service at 0-conf and the
+	// service locks splices funded only by itself at 0-conf. Keep draining events until
+	// the payment is both forwarded by the service and received by the client.
 	macro_rules! pay_lsps4_invoice {
-		($amount_sat:expr) => {{
+		($amount_sat:expr, $mine:expr) => {{
 			let amount_sat: u64 = $amount_sat;
 			let amount_msat = amount_sat * 1000;
 			let invoice_description = Bolt11InvoiceDescription::Direct(
@@ -2629,7 +2632,7 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 				}
 
 				// Confirm any pending splice/open so the LSP can retry forwarding.
-				if liquidity_pending {
+				if $mine && liquidity_pending {
 					generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 					service_node.sync_wallets().unwrap();
 					client_node.sync_wallets().unwrap();
@@ -2666,14 +2669,28 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 	}
 
 	// A request below tier[0] still opens a tier[0]-sized channel: the tier is applied.
-	let mut channel_value_sat = pay_lsps4_invoice!(50_000);
+	let mut channel_value_sat = pay_lsps4_invoice!(50_000, true);
 	assert_eq!(channel_value_sat, tier0_channel_size_sat);
 
-	// Subsequent liquidity needs grow the same channel via splicing. Exact post-splice
-	// sizes depend on reserve/capacity, so we only assert the channel never splits and
-	// never shrinks.
-	for amount_sat in [100_000u64, 20_000, 400_000] {
-		let new_value_sat = pay_lsps4_invoice!(amount_sat);
+	// Subsequent liquidity needs grow the same channel via splicing, with no blocks mined:
+	// the service forwards held HTLCs right after its own splice locks at 0-conf. Exact
+	// post-splice sizes depend on reserve/capacity, so we only assert the channel never
+	// splits and never shrinks.
+	let height_before_splices = bitcoind.client.get_blockchain_info().unwrap().blocks;
+	for (amount_sat, mine) in [(100_000u64, false), (20_000, false), (400_000, true)] {
+		if mine {
+			// The 0-conf part is done. A second splice while the first is unconfirmed opens a
+			// new channel instead, so confirm before growing the channel again.
+			assert_eq!(
+				bitcoind.client.get_blockchain_info().unwrap().blocks,
+				height_before_splices
+			);
+			generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+			service_node.sync_wallets().unwrap();
+			client_node.sync_wallets().unwrap();
+			payer_node.sync_wallets().unwrap();
+		}
+		let new_value_sat = pay_lsps4_invoice!(amount_sat, mine);
 		assert!(
 			new_value_sat >= channel_value_sat,
 			"channel shrank from {} to {}",
