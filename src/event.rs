@@ -1892,11 +1892,6 @@ where
 					return Err(ReplayEvent());
 				}
 
-				// Reset LSPS4 cooldown so the timer can retry after cooldown period.
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_splice_failed(&counterparty_node_id).await;
-				}
-
 				let event = Event::SpliceFailed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),

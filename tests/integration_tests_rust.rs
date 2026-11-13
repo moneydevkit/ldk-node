@@ -2502,7 +2502,7 @@ async fn lsps4_client_service_integration() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn lsps4_jit_channel_grows_via_splicing() {
+async fn lsps4_jit_liquidity_opens_new_channels() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 	let sync_config = EsploraSyncConfig { background_sync_config: None };
@@ -2526,9 +2526,7 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 	let service_node_id = service_node.node_id();
 	let service_listen_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
 
-	let mut client_config = random_config(true);
-	// Like lightning-js clients: lock the service's splices at 0-conf, as we trust it.
-	client_config.node_config.inbound_splice_minimum_depth = None;
+	let client_config = random_config(true);
 	setup_builder!(client_builder, client_config.node_config);
 	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	client_builder.set_liquidity_source_lsps4(service_node_id, service_listen_addr, None);
@@ -2564,20 +2562,19 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 	expect_channel_ready_event!(payer_node, service_node.node_id());
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 
-	// `channel_size_tiers` is keyed by the number of channels already open with the peer,
-	// so it only influences the *initial* channel open. Once a channel exists, the LSPS4
-	// service grows liquidity by splicing the existing channel rather than opening new
-	// ones, so the client always ends up with exactly one channel that grows monotonically.
+	// `channel_size_tiers` is keyed by the number of channels already open with the peer.
+	// When the client's channels cannot carry a payment, the LSPS4 service opens another
+	// 0-conf channel. It never splices: a splice of a channel it funded must wait for its
+	// minimum_depth, longer than it holds the HTLC.
 	let tier0_channel_size_sat = 100_000;
 
-	// Drive a single JIT payment to completion and return the client's resulting channel
-	// value with the service. A liquidity action (initial open or splice) may be needed.
-	// With `$mine` we mine blocks whenever one is pending; without it the payment must
-	// complete with no new blocks, as the client trusts the service at 0-conf and the
-	// service locks splices funded only by itself at 0-conf. Keep draining events until
-	// the payment is both forwarded by the service and received by the client.
+	// Drive a single JIT payment to completion with no blocks mined, and return the sizes of
+	// the client's channels with the service (sorted). A channel open may be needed; the
+	// client trusts the service at 0-conf, so it completes without confirmations. Keep
+	// draining events until the payment is both forwarded by the service and received by
+	// the client.
 	macro_rules! pay_lsps4_invoice {
-		($amount_sat:expr, $mine:expr) => {{
+		($amount_sat:expr) => {{
 			let amount_sat: u64 = $amount_sat;
 			let amount_msat = amount_sat * 1000;
 			let invoice_description = Bolt11InvoiceDescription::Direct(
@@ -2592,7 +2589,6 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 			let mut payer_succeeded = false;
 			let mut forwarded = false;
 			let mut client_payment_id = None;
-			let mut liquidity_pending = false;
 
 			'drive: for _ in 0..60 {
 				for node in [&service_node, &client_node, &payer_node] {
@@ -2607,8 +2603,8 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 								assert_eq!(outbound_amount_forwarded_msat, Some(amount_msat));
 								forwarded = true;
 							},
-							Event::ChannelPending { .. } | Event::SplicePending { .. } => {
-								liquidity_pending = true;
+							Event::SplicePending { .. } => {
+								panic!("LSPS4 must not splice: {:?}", event);
 							},
 							Event::PaymentSuccessful { payment_id: pid, .. }
 								if pid == Some(payment_id) =>
@@ -2631,13 +2627,6 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 					break 'drive;
 				}
 
-				// Confirm any pending splice/open so the LSP can retry forwarding.
-				if $mine && liquidity_pending {
-					generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
-					service_node.sync_wallets().unwrap();
-					client_node.sync_wallets().unwrap();
-					payer_node.sync_wallets().unwrap();
-				}
 				tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 			}
 
@@ -2650,63 +2639,37 @@ async fn lsps4_jit_channel_grows_via_splicing() {
 			assert_eq!(payment.amount_msat, Some(amount_msat));
 			assert_eq!(payment.status, PaymentStatus::Succeeded);
 
-			// Liquidity is always added by splicing the existing channel, never by opening
-			// additional ones, so the client holds exactly one channel with the service.
-			let channel_values: Vec<u64> = client_node
+			let mut channel_values: Vec<u64> = client_node
 				.list_channels()
 				.into_iter()
 				.filter(|chan| chan.counterparty_node_id == service_node.node_id())
 				.map(|chan| chan.channel_value_sats)
 				.collect();
-			assert_eq!(
-				channel_values.len(),
-				1,
-				"expected a single client<->service channel, got {:?}",
-				channel_values
-			);
-			channel_values[0]
+			channel_values.sort();
+			channel_values
 		}};
 	}
 
+	let start_height = bitcoind.client.get_blockchain_info().unwrap().blocks;
+
 	// A request below tier[0] still opens a tier[0]-sized channel: the tier is applied.
-	let mut channel_value_sat = pay_lsps4_invoice!(50_000, true);
-	assert_eq!(channel_value_sat, tier0_channel_size_sat);
+	let mut channel_values = pay_lsps4_invoice!(50_000);
+	assert_eq!(channel_values, vec![tier0_channel_size_sat]);
 
-	// Subsequent liquidity needs grow the same channel via splicing, with no blocks mined:
-	// the service forwards held HTLCs right after its own splice locks at 0-conf. Exact
-	// post-splice sizes depend on reserve/capacity, so we only assert the channel never
-	// splits and never shrinks.
-	let height_before_splices = bitcoind.client.get_blockchain_info().unwrap().blocks;
-	for (amount_sat, mine) in [(100_000u64, false), (20_000, false), (400_000, true)] {
-		if mine {
-			// The 0-conf part is done. A second splice while the first is unconfirmed opens a
-			// new channel instead, so confirm before growing the channel again.
-			assert_eq!(
-				bitcoind.client.get_blockchain_info().unwrap().blocks,
-				height_before_splices
-			);
-			generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
-			service_node.sync_wallets().unwrap();
-			client_node.sync_wallets().unwrap();
-			payer_node.sync_wallets().unwrap();
+	// Later shortfalls open more channels. Existing channels never change size (no splice).
+	for amount_sat in [100_000u64, 20_000, 400_000] {
+		let new_values = pay_lsps4_invoice!(amount_sat);
+		let mut kept = new_values.clone();
+		for value in &channel_values {
+			let pos =
+				kept.iter().position(|v| v == value).expect("an existing channel changed size");
+			kept.remove(pos);
 		}
-		let new_value_sat = pay_lsps4_invoice!(amount_sat, mine);
-		assert!(
-			new_value_sat >= channel_value_sat,
-			"channel shrank from {} to {}",
-			channel_value_sat,
-			new_value_sat
-		);
-		channel_value_sat = new_value_sat;
+		assert!(kept.len() <= 1, "more than one channel opened for one payment: {:?}", new_values);
+		channel_values = new_values;
 	}
-
-	// The channel must have grown beyond the initial tier[0] open via splicing.
-	assert!(
-		channel_value_sat > tier0_channel_size_sat,
-		"expected channel to grow beyond tier[0] ({}sat) via splicing, final size {}sat",
-		tier0_channel_size_sat,
-		channel_value_sat
-	);
+	assert!(channel_values.len() >= 2, "expected new channels, got {:?}", channel_values);
+	assert_eq!(bitcoind.client.get_blockchain_info().unwrap().blocks, start_height);
 }
 
 #[test]
